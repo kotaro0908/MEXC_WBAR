@@ -10,6 +10,7 @@ import pandas as pd
 
 logger = get_logger(__name__)
 
+
 def check_persistence():
     state_file = settings.settings.TRADE_STATE_FILE
     if os.path.exists(state_file):
@@ -19,6 +20,7 @@ def check_persistence():
             print("保存状態をリセットしました。新規で再開します。")
         else:
             print("保存状態を読み込んで再開します。")
+
 
 async def main():
     # 起動時に永続化ファイルの存在をチェック
@@ -75,37 +77,51 @@ async def main():
                 logger.warning("BOT停止フラグが検出されました。処理を終了します。")
                 break
 
-            # 最新市場データを取得
-            market_data = data_handler.get_latest_data()
-            if market_data:
-                current_timestamp = pd.to_datetime(market_data.get("timestamp"))
-                if current_timestamp != last_processed_timestamp:
-                    if current_timestamp not in processed_timestamps:
-                        logger.debug(f"Processing new market data: {market_data}")
-                        strategy.update_market_data(market_data)
-                        processed_timestamps.add(current_timestamp)
-                        last_processed_timestamp = current_timestamp
+            # デバッグ: メインループごとに処理状態をログ
+            logger.debug(f"Main loop iteration. Last processed timestamp: {last_processed_timestamp}")
 
-                        # 古いタイムスタンプの整理（履歴が1000件を超えた場合）
-                        if len(processed_timestamps) > 1000:
-                            processed_timestamps.clear()
-                            processed_timestamps.update(
-                                strategy.market_data_history['timestamp'].tail(500).tolist()
-                            )
+            # 最新の確定済み市場データを取得
+            newest_confirmed_data = data_handler.get_newest_confirmed_data()
 
-                    logger.debug(f"Market data history length: {len(strategy.market_data_history)}")
+            if newest_confirmed_data:
+                current_confirmed_timestamp = newest_confirmed_data.get("timestamp")
+                logger.debug(f"Got newest confirmed data with timestamp: {current_confirmed_timestamp}")
 
-                    # 戦略評価と注文実行
-                    await strategy.evaluate_and_execute(order_manager)
+                if current_confirmed_timestamp != last_processed_timestamp:
+                    logger.info(f"New confirmed data detected. Processing: {newest_confirmed_data}")
 
-                    # 市場価格の更新
-                    if market_data.get("close"):
-                        order_manager.update_market_price(float(market_data["close"]))
+                    # 最新の確定済みデータを更新
+                    strategy.update_market_data(newest_confirmed_data)
+
+                    # 前の確定済みデータも戦略に反映
+                    older_confirmed_data = data_handler.get_older_confirmed_data()
+                    if older_confirmed_data:
+                        strategy.update_market_data(older_confirmed_data)
+
+                    last_processed_timestamp = current_confirmed_timestamp
+
+                    # 戦略評価と注文実行（確定済みデータをもとに）
+                    logger.debug("Evaluating strategy with confirmed data")
+                    await strategy.evaluate_and_execute(order_manager, data_handler)
+                else:
+                    logger.debug(f"Skipping already processed confirmed data: {current_confirmed_timestamp}")
+            else:
+                logger.debug("No confirmed data available")
+
+            # 市場価格の更新（最新データを使用）
+            latest_data = data_handler.get_latest_data()
+            if latest_data and latest_data.get("close"):
+                current_price = float(latest_data["close"])
+                logger.debug(f"Updating market price: {current_price}")
+                order_manager.update_market_price(current_price)
+            else:
+                logger.debug("No latest data available for price update")
 
             # オーダー状態のチェック
             await order_manager.check_orders_status()
 
-            # POLLING_INTERVAL秒待機（環境変数から設定）
+            # POLLING_INTERVAL秒待機
+            logger.debug(f"Sleeping for {settings.settings.POLLING_INTERVAL} seconds")
             await asyncio.sleep(settings.settings.POLLING_INTERVAL)
 
     except KeyboardInterrupt:
@@ -122,6 +138,7 @@ async def main():
                 await data_task
             except asyncio.CancelledError:
                 pass
+
 
 if __name__ == "__main__":
     asyncio.run(main())

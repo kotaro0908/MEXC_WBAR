@@ -134,6 +134,11 @@ class OrderManager:
             logger.info("Already have position or open order, skipping new entry")
             return
 
+        # 方向転換時のロットサイズリセット処理
+        if self.open_position_side is not None and self.open_position_side != side:
+            logger.info(f"Direction changed from {self.open_position_side} to {side}. Resetting lot size.")
+            self.dynamic_lot_size = self.lot_size
+
         order_size = self.dynamic_lot_size
         if self.current_trade_id is None:
             # 永続化が有効なら復元済み状態を使用、なければ新規生成
@@ -189,7 +194,7 @@ class OrderManager:
             logger.info("=" * 40)
             logger.info("Waiting 5 seconds for entry order confirmation...")
             self._save_trade_state()
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
             status, filled_price = self._check_order_filled_retry(self.entry_order_id, max_retries=3, sleep_sec=2)
             if status != "closed":
                 logger.error(f"Entry order not confirmed. Status: {status}")
@@ -352,7 +357,7 @@ class OrderManager:
                 logger.info(f"Trade won. Lot size reset to: {self.dynamic_lot_size}")
                 self._save_trade_state()
                 self._clear_order_info()
-                self.current_trade_id = None
+                # self.current_trade_id = None
                 return
 
         for size, sl_order_id in list(self.sl_order_ids.items()):
@@ -432,7 +437,7 @@ class OrderManager:
         self.sl_order_ids = {}
         self._clear_local_cache()
         self._filled_logged = False
-        self.open_position_side = None
+        # self.open_position_side = None  # この行をコメントアウトする
 
     def _clear_local_cache(self):
         self._last_order_status = None
