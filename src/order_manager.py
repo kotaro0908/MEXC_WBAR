@@ -134,10 +134,10 @@ class OrderManager:
             logger.info("Already have position or open order, skipping new entry")
             return
 
-        # 方向転換時のロットサイズリセット処理
-        if self.open_position_side is not None and self.open_position_side != side:
-            logger.info(f"Direction changed from {self.open_position_side} to {side}. Resetting lot size.")
-            self.dynamic_lot_size = self.lot_size
+        # 方向転換時のロットサイズリセット処理 - マーチンゲールを方向に関係なく適用するためコメントアウト
+        # if self.open_position_side is not None and self.open_position_side != side:
+        #     logger.info(f"Direction changed from {self.open_position_side} to {side}. Resetting lot size.")
+        #     self.dynamic_lot_size = self.lot_size
 
         order_size = self.dynamic_lot_size
         if self.current_trade_id is None:
@@ -357,7 +357,7 @@ class OrderManager:
                 logger.info(f"Trade won. Lot size reset to: {self.dynamic_lot_size}")
                 self._save_trade_state()
                 self._clear_order_info()
-                # self.current_trade_id = None
+                # self.current_trade_id = None  # 修正: TP決済後も取引IDを維持
                 return
 
         for size, sl_order_id in list(self.sl_order_ids.items()):
@@ -390,7 +390,7 @@ class OrderManager:
                 logger.info(f"Martingale applied. New lot size: {self.dynamic_lot_size}")
                 self._save_trade_state()
                 self._clear_order_info()
-                self.current_trade_id = None
+                # self.current_trade_id = None  # 修正: SL決済後も取引IDを維持
                 return
 
     def _check_order_filled_retry(self, order_id, max_retries=5, sleep_sec=3):
@@ -437,7 +437,7 @@ class OrderManager:
         self.sl_order_ids = {}
         self._clear_local_cache()
         self._filled_logged = False
-        # self.open_position_side = None  # この行をコメントアウトする
+        # self.open_position_side = None  # 修正: ポジション方向を維持
 
     def _clear_local_cache(self):
         self._last_order_status = None

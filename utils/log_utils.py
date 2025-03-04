@@ -33,7 +33,6 @@ def log_trade_result(data: dict):
     if not os.path.exists(logs_dir):
         os.makedirs(logs_dir)
     filename = os.path.join(logs_dir, f"trade_results_{date_str}.jsonl")
-
     # エントリー時間をJSTに変換（もしUTCで渡されている場合）
     entry_time = data.get("entry_time")
     if entry_time:
@@ -45,6 +44,7 @@ def log_trade_result(data: dict):
         except Exception as e:
             logger.error(f"Error converting entry_time to JST: {e}")
 
+    # ロットサイズ情報を追加
     log_data = {
         "timestamp": now.isoformat(),
         "trade_id": data.get("trade_id"),
@@ -54,7 +54,11 @@ def log_trade_result(data: dict):
         "exit_type": data.get("exit_type"),  # "TP" or "SL"
         "exit_price": data.get("exit_price"),
         "pnl": data.get("pnl"),  # 価格差
+        "current_lot_size": data.get("current_lot_size"),  # 現在のロットサイズ
+        "next_lot_size": data.get("next_lot_size"),  # 次回のロットサイズ
+        "martingale_factor": data.get("martingale_factor", 2)  # マーチンゲール倍率
     }
+
     line = json.dumps(log_data, ensure_ascii=False)
     logger.info(f"[TRADE RESULT] {line}")
     with open(filename, "a", encoding="utf-8") as f:
