@@ -6,6 +6,7 @@ from datetime import datetime
 
 logger = get_logger(__name__)
 
+
 class DataHandler:
     def __init__(self):
         self.latest_data = {}  # 最新の1分足キャンドル情報を保持
@@ -31,6 +32,7 @@ class DataHandler:
                 dt = datetime.utcfromtimestamp(ts / 1000).isoformat()
                 data_point = {
                     "timestamp": dt,
+                    "open": open_,  # 始値を追加
                     "high": high,
                     "low": low,
                     "close": close
@@ -45,7 +47,7 @@ class DataHandler:
     async def start(self):
         """
         定期的に最新の1分足キャンドルを取得し、最新データとして更新します。
-        ポーリング間隔は10秒とし、前回のキャンドルと比較して新しいキャンドルがあれば更新します。
+        ポーリング間隔は1秒とし、前回のキャンドルと比較して新しいキャンドルがあれば更新します。
         """
         last_timestamp = None
         while True:
@@ -59,16 +61,18 @@ class DataHandler:
                     if last_timestamp is None or dt > last_timestamp:
                         self.latest_data = {
                             "timestamp": dt,
+                            "open": open_,  # 始値を追加
                             "close": close,
                             "high": high,
                             "low": low
                         }
                         last_timestamp = dt
                         logger.info(f"New candle: {self.latest_data}")
-                await asyncio.sleep(10)
+                # ポーリング間隔を1秒に変更（settings.POLLING_INTERVALを使用）
+                await asyncio.sleep(settings.settings.POLLING_INTERVAL)
             except Exception as e:
                 logger.error(f"Error fetching latest candle: {e}")
-                await asyncio.sleep(10)
+                await asyncio.sleep(settings.settings.POLLING_INTERVAL)
 
     def get_latest_data(self):
         return self.latest_data

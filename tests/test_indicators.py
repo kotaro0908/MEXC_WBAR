@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import pytest
-from src.indicators import calculate_bollinger, calculate_adx
+from tests.indicators import calculate_bollinger, calculate_adx
 
 def test_bollinger_constant():
     """

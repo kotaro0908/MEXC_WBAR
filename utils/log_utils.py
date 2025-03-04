@@ -50,14 +50,10 @@ def log_trade_result(data: dict):
         "trade_id": data.get("trade_id"),
         "entry_time": entry_time,
         "entry_price": data.get("entry_price"),
-        "adx_value": data.get("adx_value"),
         "direction": data.get("direction"),  # "LONG" or "SHORT"
         "exit_type": data.get("exit_type"),  # "TP" or "SL"
         "exit_price": data.get("exit_price"),
         "pnl": data.get("pnl"),  # 価格差
-        "bb_upper": data.get("bb_upper"),
-        "bb_lower": data.get("bb_lower"),
-        "bb_middle": data.get("bb_middle")
     }
     line = json.dumps(log_data, ensure_ascii=False)
     logger.info(f"[TRADE RESULT] {line}")

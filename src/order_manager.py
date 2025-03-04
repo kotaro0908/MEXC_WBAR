@@ -50,6 +50,7 @@ class OrderManager:
         self.order_timestamp = None
         self.current_trade_id = None
         self.tp_order_ids = {}  # 利確注文のID管理
+        self.sl_order_ids = {}  # ストップロス注文のID管理（追加）
         self.current_market_price = None
         self._filled_logged = False  # 追加
 
@@ -109,9 +110,22 @@ class OrderManager:
             logger.debug(f"Order is locked until {datetime.fromtimestamp(self.order_lock_until)}")
             return True
 
-        # 実際のポジションチェック
-        if self.get_current_position_size() > 0:
-            logger.debug("Found existing position")
+        try:
+            # より厳密なポジションチェック
+            positions = self.exchange.fetch_positions([self.ccxt_symbol])
+            for position in positions:
+                size = float(position.get('contracts', 0))
+                if abs(size) > 0.0001:  # ほぼゼロでない値
+                    logger.debug(f"Found existing position with size: {size}")
+                    return True
+        except Exception as e:
+            logger.error(f"Error checking positions: {e}")
+            # エラー時は安全側に倒してTrueを返す
+            return True
+
+        # TPまたはSLオーダーがあればTrueを返す
+        if self.tp_order_ids or self.sl_order_ids:
+            logger.debug(f"Found existing TP/SL orders: TP={len(self.tp_order_ids)}, SL={len(self.sl_order_ids)}")
             return True
 
         # オープンオーダーのチェック
@@ -126,12 +140,16 @@ class OrderManager:
                 logger.debug("Found open entry order")
                 return True
 
-        # TPオーダーのチェック
-        for tp_order_id in self.tp_order_ids.values():
-            status, _ = self._check_order_filled_retry(tp_order_id)
-            if status == "open":
-                logger.debug("Found open TP order")
+        # API経由での未約定注文のダブルチェック
+        try:
+            open_orders = self.exchange.fetch_open_orders(symbol=self.ccxt_symbol)
+            if open_orders and len(open_orders) > 0:
+                logger.debug(f"Found {len(open_orders)} open orders via API check")
                 return True
+        except Exception as e:
+            logger.error(f"Error checking open orders: {e}")
+            # エラー時は安全側に倒してTrueを返す
+            return True
 
         return False
 
@@ -164,31 +182,40 @@ class OrderManager:
         # 最終トレード時間を更新
         self.last_trade_time = time.time()
 
+        # BTCの場合、価格精度は小数点以下1桁
+        price_precision = 1
+
+        # 方向設定
         if side == "SHORT":
             order_side = 3
-            order_price = trigger_price + self.trade_logic.offset_entry
-            sl_price = order_price + self.trade_logic.offset_sl
+            # SL/TP価格を計算
+            sl_price = round(trigger_price + self.trade_logic.offset_sl, price_precision)
+            tp_price = round(trigger_price - self.trade_logic.offset_tp, price_precision)
         else:
             order_side = 1
-            order_price = trigger_price - self.trade_logic.offset_entry
-            sl_price = order_price - self.trade_logic.offset_sl
+            # SL/TP価格を計算
+            sl_price = round(trigger_price - self.trade_logic.offset_sl, price_precision)
+            tp_price = round(trigger_price + self.trade_logic.offset_tp, price_precision)
 
-        # stop loss価格を trade_info に保存
+        # 計算したSL/TP価格をtrade_infoに保存
         self.trade_info["stop_loss_price"] = sl_price
+        self.trade_info["take_profit_price"] = tp_price
 
+        # 成行注文パラメータ（SLとTPを含む）
         params = {
             "symbol": self.ws_symbol,
             "side": order_side,
             "openType": 2,
-            "type": "2",
-            "vol": str(self.dynamic_lot_size),
+            "type": "5",  # 5 = 成行注文
+            "vol": str(round(self.dynamic_lot_size, 3)),  # 3桁に丸める
             "leverage": self.leverage,
-            "price": f"{order_price:.6f}",
             "priceProtect": "0",
-            "stopLossPrice": f"{sl_price:.6f}"
+            "stopLossPrice": f"{sl_price}",  # ストップロス価格
+            "takeProfitPrice": f"{tp_price}"  # 利確価格
         }
 
-        logger.debug(f"Placing entry order with size: {order_size}")
+        logger.debug(
+            f"Placing entry order with size: {round(self.dynamic_lot_size, 3)}, SL: {sl_price}, TP: {tp_price}")
         response = self._place_order(params)
         if response and response.get("success"):
             self.entry_order_id = response["data"]
@@ -196,7 +223,7 @@ class OrderManager:
             self.order_lock_until = time.time() + 5
             logger.info("=" * 40)
             logger.info(
-                f"[ORDER PLACED] {side} Entry - Size: {order_size}, Price: {order_price:.6f}, Stop Loss: {sl_price:.6f}")
+                f"[ORDER PLACED] {side} Entry - Size: {round(self.dynamic_lot_size, 3)}, Market Order with SL: {sl_price}, TP: {tp_price}")
             logger.info("=" * 40)
             logger.info("Waiting 5 seconds for MEXC to register the new order...")
             # トレード状態を保存
@@ -204,6 +231,153 @@ class OrderManager:
             await asyncio.sleep(2)
         else:
             logger.error(f"Failed to place entry order: {response}")
+            # もしエラーの原因がTP/SLの同時設定であれば、ここで代替アプローチを試すロジックを追加できる
+
+    async def place_stop_loss_order(self, position_size: float, entry_price: float):
+        """
+        ストップロス注文を発注する（エントリー後に個別に設定する場合用）
+
+        Parameters:
+            position_size (float): ポジションサイズ
+            entry_price (float): エントリー価格（約定済みの実際の価格）
+
+        Returns:
+            bool: 成功したらTrue、失敗したらFalse
+        """
+        if position_size in self.sl_order_ids:
+            logger.debug(f"SL Skip - Order exists for size: {position_size}")
+            return True
+
+        if position_size <= 0:
+            logger.debug(f"SL Skip - Invalid size: {position_size}")
+            return False
+
+        # BTCの場合、価格精度は小数点以下1桁
+        price_precision = 1
+
+        # 約定価格からSL価格を計算
+        if self.open_position_side == "SHORT":
+            sl_price = round(entry_price + self.trade_logic.offset_sl, price_precision)
+            close_side = 2  # SHORTポジションのクローズ
+        else:
+            sl_price = round(entry_price - self.trade_logic.offset_sl, price_precision)
+            close_side = 4  # LONGポジションのクローズ
+
+        # 計算したSL価格をtrade_infoに保存
+        self.trade_info["stop_loss_price"] = sl_price
+
+        logger.debug(
+            f"SL Order Details - Side: {self.open_position_side}, Close Side: {close_side}, Price: {sl_price}")
+
+        # MEXCでストップロス注文を作成する試行
+        try:
+            # 通常の指値注文として設定
+            sl_params = {
+                "symbol": self.ws_symbol,
+                "side": close_side,
+                "openType": 2,
+                "type": "1",  # 通常の指値注文
+                "vol": str(position_size),
+                "leverage": self.leverage,
+                "price": f"{sl_price}",
+                "priceProtect": "0"
+            }
+
+            logger.debug(f"SL Order Parameters: {sl_params}")
+
+            sl_response = self._place_order(sl_params)
+
+            # 失敗した場合はエラーログを残し失敗を返す
+            if not (sl_response and sl_response.get("success")):
+                logger.warning(f"SL order attempt failed: {sl_response}")
+                logger.warning("Continuing without SL order. Will rely on TP order only.")
+                return False
+
+            # 成功した場合
+            self.sl_order_ids[position_size] = sl_response["data"]
+            logger.info("=" * 40)
+            logger.info(f"[SL ORDER PLACED] Size: {position_size}, Price: {sl_price}")
+            logger.info("=" * 40)
+            log_json("SL_ORDER_PLACED", {
+                "trade_id": self.current_trade_id,
+                "position_size": position_size,
+                "sl_price": sl_price,
+                "entry_price": entry_price,
+                "order_id": sl_response["data"]
+            })
+            # 状態を保存
+            self._save_trade_state()
+            return True
+
+        except Exception as e:
+            logger.error(f"Exception in place_stop_loss_order: {str(e)}")
+            logger.warning("Continuing without SL order due to exception.")
+            return False
+
+    async def place_take_profit_order(self, position_size: float, filled_price: float):
+        """
+        利確注文を発注する（エントリー後に個別に設定する場合用）
+
+        Parameters:
+            position_size (float): ポジションサイズ
+            filled_price (float): エントリー約定価格
+
+        Returns:
+            bool: 成功したらTrue、失敗したらFalse
+        """
+        if position_size in self.tp_order_ids:
+            logger.debug(f"TP Skip - Order exists for size: {position_size}")
+            return True
+
+        if position_size <= 0:
+            logger.debug(f"TP Skip - Invalid size: {position_size}")
+            return False
+
+        # BTCの場合、価格精度は小数点以下1桁
+        price_precision = 1
+
+        if self.open_position_side == "SHORT":
+            tp_price = round(filled_price - self.trade_logic.offset_tp, price_precision)
+            close_side = 2  # SHORTポジションのクローズ
+        else:
+            tp_price = round(filled_price + self.trade_logic.offset_tp, price_precision)
+            close_side = 4  # LONGポジションのクローズ
+
+        logger.debug(
+            f"TP Order Details - Side: {self.open_position_side}, Close Side: {close_side}, Price: {tp_price}")
+
+        tp_params = {
+            "symbol": self.ws_symbol,
+            "side": close_side,
+            "openType": 2,
+            "type": "2",  # ポストオンリー注文
+            "vol": str(position_size),
+            "leverage": self.leverage,
+            "price": f"{tp_price}",
+            "priceProtect": "0"
+        }
+
+        logger.debug(f"TP Order Parameters: {tp_params}")
+
+        tp_response = self._place_order(tp_params)
+        if tp_response and tp_response.get("success"):
+            self.tp_order_ids[position_size] = tp_response["data"]
+            logger.info("=" * 40)
+            logger.info(f"[TP ORDER PLACED] Size: {position_size}, Price: {tp_price}")
+            logger.info("=" * 40)
+            log_json("TP_ORDER_PLACED", {
+                "trade_id": self.current_trade_id,
+                "position_size": position_size,
+                "tp_price": tp_price,
+                "filled_price": filled_price,
+                "order_id": tp_response["data"]
+            })
+            # 状態を保存（TP注文発注後）
+            self._save_trade_state()
+            return True
+        else:
+            logger.error(f"Failed to place take profit order: {tp_response}")
+            return False
 
     async def check_orders_status(self):
         if self.entry_order_id:
@@ -218,51 +392,10 @@ class OrderManager:
                 # 注文IDをクリアして重複検知を防ぐ
                 self.entry_order_id = None
 
-                # 損切り判定：APIから取得した filled_price とエントリー時に設定した stop_loss_price を比較
-                logger.debug(
-                    f"SL check - side: {self.open_position_side}, filled_price: {filled_price}, stop_loss_price: {self.trade_info.get('stop_loss_price')}")
-                is_stop_loss = False
-                if self.open_position_side == "LONG":
-                    # LONGの場合：filled_price が stop_loss_price 以下なら損切り
-                    if filled_price <= self.trade_info.get("stop_loss_price", 0):
-                        is_stop_loss = True
-                        logger.debug(
-                            f"LONG SL triggered - filled_price({filled_price}) <= stop_loss({self.trade_info.get('stop_loss_price', 0)})")
-                elif self.open_position_side == "SHORT":
-                    # SHORTの場合：filled_price が stop_loss_price 以上なら損切り
-                    if filled_price >= self.trade_info.get("stop_loss_price", 0):
-                        is_stop_loss = True
-                        logger.debug(
-                            f"SHORT SL triggered - filled_price({filled_price}) >= stop_loss({self.trade_info.get('stop_loss_price', 0)})")
-
-                if is_stop_loss:
-                    logger.info("Stop loss triggered. Updating dynamic lot size (loss).")
-
-                    # トレード結果の作成
-                    trade_result = {
-                        **self.trade_info,
-                        "exit_type": "SL",
-                        "exit_price": filled_price,
-                        "pnl": None
-                    }
-
-                    # トレード結果をログに記録
-                    log_trade_result(trade_result)
-
-                    # 監視モジュールにトレード結果を通知 (追加)
-                    if self.monitor:
-                        self.monitor.update_trade_result(trade_result)
-
-                    self.dynamic_lot_size = math.ceil(self.dynamic_lot_size * self.martingale_factor)
-                    # 状態を保存（ロットサイズを増加させた後）
-                    self._save_trade_state()
-                    self._clear_order_info()
-                    return
-
-                # もし損切りでなければ、通常の勝ち処理としてTP注文を発注
+                # ログ出力と状態更新
                 logger.info("=" * 40)
                 logger.info(
-                    f"[ORDER FILLED] {self.open_position_side} at Price: {filled_price:.6f}, Current Position: {position_size}")
+                    f"[ORDER FILLED] {self.open_position_side} at Price: {filled_price}, Current Position: {position_size}")
                 logger.info("=" * 40)
 
                 self.trade_info["entry_price"] = filled_price
@@ -277,21 +410,38 @@ class OrderManager:
                 })
 
                 self.entry_price = filled_price or 0
-                logger.debug(
-                    f"Preparing TP order - Side: {self.open_position_side}, Entry Price: {self.entry_price}, Position: {position_size}")
-                logger.info("Waiting 2 seconds before placing TP order to avoid API limit issues...")
                 # 状態を保存
                 self._save_trade_state()
-                await asyncio.sleep(2)
 
+                # 【アプローチ1では、エントリーと同時にTP/SLが設定されるため、
+                # 別途TP/SLを設定するコードはコメントアウトしています】
+                # しかし、もしアプローチ1が失敗した場合に備えて、コードは保持しておく
+                """
                 if position_size > 0:
-                    logger.debug("Attempting to place TP order...")
-                    success = await self.place_take_profit_order(position_size, filled_price)
-                    if success:
-                        logger.debug(f"TP order placement result: {success}")
-                    else:
-                        logger.error("Failed to place TP order, keeping position info")
-                        self._clear_order_info()
+                    try:
+                        # SL注文を先に設定
+                        logger.debug("Attempting to place SL order...")
+                        sl_success = await self.place_stop_loss_order(position_size, filled_price)
+                        if not sl_success:
+                            logger.warning("Failed to place SL order, continuing with TP order")
+
+                        # 2秒待機してからTP注文を発注
+                        logger.debug(
+                            f"Preparing TP order - Side: {self.open_position_side}, Entry Price: {self.entry_price}, Position: {position_size}")
+                        logger.info("Waiting 2 seconds before placing TP order to avoid API limit issues...")
+                        await asyncio.sleep(2)
+
+                        # TP注文を設定
+                        logger.debug("Attempting to place TP order...")
+                        tp_success = await self.place_take_profit_order(position_size, filled_price)
+                        if tp_success:
+                            logger.debug(f"TP order placement result: {tp_success}")
+                        else:
+                            logger.error("Failed to place TP order, keeping position info")
+                    except Exception as e:
+                        logger.error(f"Error placing TP/SL orders: {str(e)}")
+                        # エラーがあっても状態はクリアせず、次回のチェックで再処理できるようにする
+                """
                 return
             elif status == "canceled":
                 logger.info("=" * 40)
@@ -343,6 +493,13 @@ class OrderManager:
                     self.monitor.update_trade_result(trade_result)
 
                 del self.tp_order_ids[size]
+
+                # SLオーダーもあれば削除
+                if size in self.sl_order_ids:
+                    sl_order_id = self.sl_order_ids[size]
+                    self._cancel_orders([sl_order_id])
+                    del self.sl_order_ids[size]
+
                 self.dynamic_lot_size = math.ceil(self.dynamic_lot_size * self.martingale_factor)
                 # 状態を保存（ロットサイズ変更後）
                 self._save_trade_state()
@@ -376,6 +533,13 @@ class OrderManager:
                 })
 
                 del self.tp_order_ids[size]
+
+                # SLオーダーもあれば削除
+                if size in self.sl_order_ids:
+                    sl_order_id = self.sl_order_ids[size]
+                    self._cancel_orders([sl_order_id])
+                    del self.sl_order_ids[size]
+
                 self.dynamic_lot_size = self.lot_size  # 勝ちの場合は基本ロットサイズにリセット
                 # 状態を保存（ロットサイズリセット後）
                 self._save_trade_state()
@@ -383,57 +547,52 @@ class OrderManager:
                 logger.debug("Position and order info cleared after TP filled")
                 return
 
-    async def place_take_profit_order(self, position_size: float, filled_price: float):
-        if position_size in self.tp_order_ids:
-            logger.debug(f"TP Skip - Order exists for size: {position_size}")
-            return True
+        # SLオーダーのチェック（追加）
+        for size, sl_order_id in list(self.sl_order_ids.items()):
+            status, filled_price = self._check_order_filled_retry(sl_order_id)
+            logger.debug(f"SL order check - order_id: {sl_order_id}, status: {status}")
+            if status == "closed":
+                logger.info("=" * 40)
+                logger.info(f"[SL ORDER FILLED] Size: {size}, Filled Price: {filled_price}")
+                logger.info("=" * 40)
+                pnl = filled_price - self.trade_info["entry_price"] if self.open_position_side == "LONG" else \
+                    self.trade_info["entry_price"] - filled_price
 
-        if position_size <= 0:
-            logger.debug(f"TP Skip - Invalid size: {position_size}")
-            return False
+                # トレード結果の作成
+                trade_result = {
+                    **self.trade_info,
+                    "exit_type": "SL",
+                    "exit_price": filled_price,
+                    "pnl": pnl
+                }
 
-        if self.open_position_side == "SHORT":
-            tp_price = filled_price - self.trade_logic.offset_tp
-            close_side = 2  # SHORTポジションのクローズ
-        else:
-            tp_price = filled_price + self.trade_logic.offset_tp
-            close_side = 4  # LONGポジションのクローズ
+                # トレード結果をログに記録
+                log_trade_result(trade_result)
 
-        logger.debug(
-            f"TP Order Details - Side: {self.open_position_side}, Close Side: {close_side}, Price: {tp_price:.6f}")
+                # 監視モジュールにトレード結果を通知
+                if self.monitor:
+                    self.monitor.update_trade_result(trade_result)
 
-        tp_params = {
-            "symbol": self.ws_symbol,
-            "side": close_side,
-            "openType": 2,
-            "type": "1",
-            "vol": str(position_size),
-            "leverage": self.leverage,
-            "price": f"{tp_price:.6f}",
-            "priceProtect": "0"
-        }
+                log_json("SL_ORDER_FILLED", {
+                    "trade_id": self.current_trade_id,
+                    "position_size": size,
+                    "filled_price": filled_price
+                })
 
-        logger.debug(f"TP Order Parameters: {tp_params}")
+                del self.sl_order_ids[size]
 
-        tp_response = self._place_order(tp_params)
-        if tp_response and tp_response.get("success"):
-            self.tp_order_ids[position_size] = tp_response["data"]
-            logger.info("=" * 40)
-            logger.info(f"[TP ORDER PLACED] Size: {position_size}, Price: {tp_price:.6f}")
-            logger.info("=" * 40)
-            log_json("TP_ORDER_PLACED", {
-                "trade_id": self.current_trade_id,
-                "position_size": position_size,
-                "tp_price": tp_price,
-                "filled_price": filled_price,
-                "order_id": tp_response["data"]
-            })
-            # 状態を保存（TP注文発注後）
-            self._save_trade_state()
-            return True
-        else:
-            logger.error(f"Failed to place take profit order: {tp_response}")
-            return False
+                # TPオーダーもあれば削除
+                if size in self.tp_order_ids:
+                    tp_order_id = self.tp_order_ids[size]
+                    self._cancel_orders([tp_order_id])
+                    del self.tp_order_ids[size]
+
+                self.dynamic_lot_size = math.ceil(self.dynamic_lot_size * self.martingale_factor)  # 負けの場合はロットサイズを増加
+                # 状態を保存（ロットサイズ変更後）
+                self._save_trade_state()
+                self._clear_order_info()
+                logger.debug("Position and order info cleared after SL filled")
+                return
 
     def _check_order_filled_retry(self, order_id, max_retries=5, sleep_sec=3):
         for attempt in range(1, max_retries + 1):
@@ -478,6 +637,7 @@ class OrderManager:
         # self.current_trade_id = None
         self.order_lock_until = time.time() + 5  # キャンセル時にも5秒間ロック
         self.tp_order_ids = {}
+        self.sl_order_ids = {}  # SLオーダーIDもクリア
         self._clear_local_cache()
         self._filled_logged = False
         self.open_position_side = None
@@ -580,6 +740,7 @@ class OrderManager:
                 'open_position_side': self.open_position_side,
                 'last_trade_time': time.time(),
                 'tp_order_ids': self.tp_order_ids,
+                'sl_order_ids': self.sl_order_ids,  # SLオーダーIDも保存
                 'entry_price': self.entry_price
             }
 
@@ -624,6 +785,7 @@ class OrderManager:
         self.dynamic_lot_size = saved_state.get('dynamic_lot_size', self.lot_size)
         self.open_position_side = saved_state.get('open_position_side')
         self.tp_order_ids = saved_state.get('tp_order_ids', {})
+        self.sl_order_ids = saved_state.get('sl_order_ids', {})  # SLオーダーIDも復元
         self.entry_price = saved_state.get('entry_price')
         self.last_trade_time = saved_state.get('last_trade_time', time.time())
 
@@ -667,6 +829,7 @@ class OrderManager:
         self.entry_price = None
         self.order_timestamp = None
         self.tp_order_ids = {}
+        self.sl_order_ids = {}  # SLオーダーIDもクリア
         self.open_position_side = None
 
         # 永続化が有効な場合は、リセットした状態を保存
