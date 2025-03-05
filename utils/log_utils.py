@@ -14,6 +14,11 @@ def log_json(event_name, data: dict):
     if not os.path.exists(logs_dir):
         os.makedirs(logs_dir)
     filename = os.path.join(logs_dir, f"trades_{date_str}.jsonl")
+
+    # データに傾き値が含まれていれば保持、なければデフォルト値を設定
+    if "slope_value" not in data and event_name in ["ENTRY_FILLED", "ORDER_PLACED"]:
+        data["slope_value"] = data.get("slope_value", 0.0)
+
     log_data = {
         "trade_id": data.get("trade_id", f"T{now.strftime('%Y%m%d_%H%M%S')}"),
         "timestamp": now.isoformat(),
@@ -43,7 +48,6 @@ def log_trade_result(data: dict):
             entry_time = entry_time_dt.astimezone(JST).isoformat()
         except Exception as e:
             logger.error(f"Error converting entry_time to JST: {e}")
-
     # ロットサイズ情報を追加
     log_data = {
         "timestamp": now.isoformat(),
@@ -56,9 +60,9 @@ def log_trade_result(data: dict):
         "pnl": data.get("pnl"),  # 価格差
         "current_lot_size": data.get("current_lot_size"),  # 現在のロットサイズ
         "next_lot_size": data.get("next_lot_size"),  # 次回のロットサイズ
-        "martingale_factor": data.get("martingale_factor", 2)  # マーチンゲール倍率
+        "martingale_factor": data.get("martingale_factor", 2),  # マーチンゲール倍率
+        "slope_value": data.get("slope_value", 0.0)  # 傾き値を追加
     }
-
     line = json.dumps(log_data, ensure_ascii=False)
     logger.info(f"[TRADE RESULT] {line}")
     with open(filename, "a", encoding="utf-8") as f:

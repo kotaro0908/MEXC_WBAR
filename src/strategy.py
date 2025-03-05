@@ -1,3 +1,5 @@
+import os
+import numpy as np
 import pandas as pd
 from utils.logger import get_logger
 from config.settings import settings
@@ -16,6 +18,11 @@ class Strategy:
 
         # 連続ローソク足の本数設定
         self.consecutive_candles = settings.CONSECUTIVE_CANDLES
+
+        # BOX相場検出のパラメータを追加
+        self.ma_period = int(os.getenv("MA_PERIOD", 20))  # 移動平均線の期間
+        self.slope_period = int(os.getenv("SLOPE_PERIOD", 5))  # 傾き確認期間
+        self.slope_threshold = float(os.getenv("SLOPE_THRESHOLD", 0.1))  # 傾き閾値
 
         # 市場データ履歴の初期化（データ型を明示的に指定）
         self.market_data_history = pd.DataFrame({
@@ -110,10 +117,83 @@ class Strategy:
             logger.error(f"Error updating market data: {str(e)}")
             return
 
+    def calculate_moving_average(self, period=None):
+        """
+        指定された期間の移動平均線を計算
+        """
+        if period is None:
+            period = self.ma_period
+
+        if len(self.market_data_history) < period:
+            logger.debug(f"Not enough data for {period}-period MA calculation")
+            return None
+
+        # 確定済みのローソク足のみを選択
+        confirmed_data = self.market_data_history[self.market_data_history['is_confirmed'] == True]
+
+        if len(confirmed_data) < period:
+            logger.debug(f"Not enough confirmed data for {period}-period MA calculation")
+            return None
+
+        # 時間順にソート
+        sorted_data = confirmed_data.sort_values('timestamp')
+
+        # 終値の移動平均を計算
+        sorted_data['ma'] = sorted_data['close'].rolling(window=period).mean()
+
+        return sorted_data.dropna()  # NaN値を含む行を削除して返す
+
+    def calculate_slope(self, data):
+        """
+        価格系列の傾きを度数で計算
+        """
+        if data is None or len(data) < 2:
+            return 0
+
+        # Y値（移動平均線）
+        y = data['ma'].values
+        # X値（時間をインデックスに変換）
+        x = np.arange(len(y))
+
+        # 線形回帰で傾きを計算
+        slope, _ = np.polyfit(x, y, 1)
+
+        # 傾きをラジアンから度数に変換（±90度の範囲）
+        degrees = np.arctan(slope) * (180.0 / np.pi)
+
+        return degrees
+
+    def is_box_market(self):
+        """
+        BOX相場かどうかを判定し、傾き値をログに出力
+        """
+        # 移動平均線を計算
+        ma_data = self.calculate_moving_average()
+        if ma_data is None or len(ma_data) < self.slope_period:
+            logger.debug("Not enough data for box market detection")
+            return False, 0.0  # 傾き値も返す
+
+        # 直近のデータでスロープを計算
+        recent_data = ma_data.tail(self.slope_period)
+        slope = self.calculate_slope(recent_data)
+
+        # 傾きが閾値以内ならBOX相場と判定
+        is_box = abs(slope) <= self.slope_threshold
+
+        if is_box:
+            logger.info(f"BOX market detected: MA slope = {slope:.4f} degrees (threshold: ±{self.slope_threshold})")
+        else:
+            # BOX相場でない場合も傾き値をログに出力
+            logger.info(
+                f"Trending market detected: MA slope = {slope:.4f} degrees (threshold: ±{self.slope_threshold})")
+
+        return is_box, slope  # 傾き値も返すように変更
+
     def check_entry_conditions(self):
         """
         確定済みの連続した同方向のローソク足を検出してエントリー条件を判定する
         追加条件：連続陽線/陰線ではキャンドル間の連続性も確認する
+        BOX相場検出機能を追加し、傾き値をログに記録
         """
         if len(self.market_data_history) < self.consecutive_candles:
             logger.debug(f"Not enough candles for entry conditions. Need at least {self.consecutive_candles}.")
@@ -124,6 +204,12 @@ class Strategy:
 
         if len(confirmed_data) < self.consecutive_candles:
             logger.debug(f"Not enough confirmed candles. Need at least {self.consecutive_candles}.")
+            return None
+
+        # BOX相場チェック - BOX相場ならエントリーしない
+        is_box, slope_value = self.is_box_market()  # 傾き値も取得
+        if is_box:
+            logger.info(f"Entry skipped: BOX market detected with slope {slope_value:.4f} degrees")
             return None
 
         # 時間順にソート
@@ -177,11 +263,13 @@ class Strategy:
 
         # エントリー条件の判定
         if all_bullish and continuous_price_movement:
-            logger.info("LONG entry condition met: All candles are bullish with price continuity")
-            return "LONG"
+            logger.info(
+                f"LONG entry condition met: All candles are bullish with price continuity. Slope: {slope_value:.4f} degrees")
+            return "LONG", slope_value  # 傾き値も返す
         elif all_bearish and continuous_price_movement:
-            logger.info("SHORT entry condition met: All candles are bearish with price continuity")
-            return "SHORT"
+            logger.info(
+                f"SHORT entry condition met: All candles are bearish with price continuity. Slope: {slope_value:.4f} degrees")
+            return "SHORT", slope_value  # 傾き値も返す
         else:
             return None
 
@@ -205,27 +293,33 @@ class Strategy:
                 return
 
             # 連続ローソク足でエントリー条件をチェック
-            direction = self.check_entry_conditions()
-            logger.debug(f"Entry conditions evaluated: {direction}")
+            entry_result = self.check_entry_conditions()
 
-            if direction is None:
+            # 戻り値がNoneの場合はエントリー条件未達
+            if entry_result is None:
                 logger.debug("No entry conditions met")
                 return
+
+            # 戻り値からdirectionとslope_valueを取り出す
+            direction, slope_value = entry_result
+
+            logger.debug(f"Entry conditions evaluated: {direction}, Slope: {slope_value:.4f}")
 
             # 最新の確定済み価格を取得
             confirmed_data = self.market_data_history[self.market_data_history['is_confirmed'] == True]
             sorted_data = confirmed_data.sort_values('timestamp')
             latest_price = sorted_data["close"].iloc[-1]
 
-            # トレード情報の準備
+            # トレード情報の準備（傾き値を追加）
             trade_info = {
                 "entry_time": datetime.utcnow().isoformat(),
                 "entry_price": latest_price,
-                "direction": direction
+                "direction": direction,
+                "slope_value": slope_value  # 傾き値を追加
             }
 
             logger.info(
-                f"{direction} entry signal: {self.consecutive_candles} consecutive {direction.lower()} candles detected")
+                f"{direction} entry signal: {self.consecutive_candles} consecutive {direction.lower()} candles detected with slope {slope_value:.4f} degrees")
             await order_manager.place_entry_order(side=direction, trigger_price=latest_price, trade_info=trade_info)
 
         except Exception as e:
