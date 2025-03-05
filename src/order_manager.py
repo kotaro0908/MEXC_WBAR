@@ -61,6 +61,7 @@ class OrderManager:
 
         self.dynamic_lot_size = self.lot_size
         self.martingale_factor = 2
+        self.consecutive_losses = 0  # 追加: 連続損失カウンター
 
         self.exchange = ccxt.mexc({
             'apiKey': self.api_key,
@@ -134,10 +135,10 @@ class OrderManager:
             logger.info("Already have position or open order, skipping new entry")
             return
 
-        # 方向転換時のロットサイズリセット処理 - マーチンゲールを方向に関係なく適用するためコメントアウト
-        # if self.open_position_side is not None and self.open_position_side != side:
-        #     logger.info(f"Direction changed from {self.open_position_side} to {side}. Resetting lot size.")
-        #     self.dynamic_lot_size = self.lot_size
+        # 方向転換時のロットサイズリセット処理 - 削除 (マーチンゲールを方向に関係なく適用)
+
+        # 現在のマーチンゲール状態をログに出力
+        logger.info(f"Placing {side} order with size {self.dynamic_lot_size} (consecutive losses: {self.consecutive_losses})")
 
         order_size = self.dynamic_lot_size
         if self.current_trade_id is None:
@@ -147,8 +148,9 @@ class OrderManager:
                 if saved_state and not self._is_state_reset_needed(saved_state):
                     self.current_trade_id = saved_state.get('trade_id')
                     self.dynamic_lot_size = saved_state.get('dynamic_lot_size', self.lot_size)
+                    self.consecutive_losses = saved_state.get('consecutive_losses', 0)  # 追加
                     self.open_position_side = saved_state.get('open_position_side')
-                    logger.info(f"Restored trade state: ID={self.current_trade_id}, lot={self.dynamic_lot_size}")
+                    logger.info(f"Restored trade state: ID={self.current_trade_id}, lot={self.dynamic_lot_size}, consecutive_losses={self.consecutive_losses}")
                 else:
                     self.current_trade_id = f"T{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
             else:
@@ -169,6 +171,11 @@ class OrderManager:
 
         self.trade_info["stop_loss_price"] = sl_price
         self.trade_info["take_profit_price"] = tp_price
+        # 追加: 現在のロットサイズと次回予測ロットサイズを記録
+        self.trade_info["current_lot_size"] = self.dynamic_lot_size
+        self.trade_info["next_lot_size"] = math.ceil(self.dynamic_lot_size * self.martingale_factor) if self.consecutive_losses > 0 else self.lot_size
+        self.trade_info["consecutive_losses"] = self.consecutive_losses
+        self.trade_info["martingale_factor"] = self.martingale_factor
 
         # ※TP注文は除外し、SLのみエントリー注文に付与
         params = {
@@ -190,11 +197,11 @@ class OrderManager:
             self.order_timestamp = datetime.utcnow().isoformat()
             self.order_lock_until = time.time() + 5
             logger.info("=" * 40)
-            logger.info(f"[ORDER PLACED] {side} Entry - Size: {round(self.dynamic_lot_size, 3)}, SL: {sl_price}")
+            logger.info(f"[ORDER PLACED] {side} Entry - Size: {round(self.dynamic_lot_size, 3)}, SL: {sl_price}, Consecutive Losses: {self.consecutive_losses}")
             logger.info("=" * 40)
             logger.info("Waiting 5 seconds for entry order confirmation...")
             self._save_trade_state()
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
             status, filled_price = self._check_order_filled_retry(self.entry_order_id, max_retries=3, sleep_sec=2)
             if status != "closed":
                 logger.error(f"Entry order not confirmed. Status: {status}")
@@ -276,12 +283,17 @@ class OrderManager:
                 logger.info("=" * 40)
                 self.trade_info["entry_price"] = filled_price
                 self.trade_info["trade_id"] = self.current_trade_id
+                self.trade_info["current_lot_size"] = self.dynamic_lot_size
+                self.trade_info["next_lot_size"] = math.ceil(self.dynamic_lot_size * self.martingale_factor) if self.consecutive_losses > 0 else self.lot_size
                 log_json("ENTRY_FILLED", {
                     "trade_id": self.current_trade_id,
                     "side": self.open_position_side,
                     "filled_price": filled_price,
                     "position_size": position_size,
-                    "order_timestamp": self.order_timestamp
+                    "order_timestamp": self.order_timestamp,
+                    "consecutive_losses": self.consecutive_losses,
+                    "current_lot_size": self.dynamic_lot_size,
+                    "next_lot_size": math.ceil(self.dynamic_lot_size * self.martingale_factor) if self.consecutive_losses > 0 else self.lot_size
                 })
                 self.entry_price = filled_price or 0
                 self._save_trade_state()
@@ -318,7 +330,9 @@ class OrderManager:
                 trade_result = {**self.trade_info,
                                 "exit_type": "SL",
                                 "exit_price": filled_price,
-                                "pnl": pnl}
+                                "pnl": pnl,
+                                "current_lot_size": self.dynamic_lot_size,
+                                "next_lot_size": math.ceil(self.dynamic_lot_size * self.martingale_factor)}
                 log_trade_result(trade_result)
                 if self.monitor:
                     self.monitor.update_trade_result(trade_result)
@@ -327,7 +341,10 @@ class OrderManager:
                     sl_order_id = self.sl_order_ids[size]
                     self._cancel_orders([sl_order_id])
                     del self.sl_order_ids[size]
+                # 損失が出たのでマーチンゲールを適用
+                self.consecutive_losses += 1
                 self.dynamic_lot_size = math.ceil(self.dynamic_lot_size * self.martingale_factor)
+                logger.info(f"Martingale applied. Consecutive losses: {self.consecutive_losses}, New lot size: {self.dynamic_lot_size}")
                 self._save_trade_state()
                 continue
             if status == "closed":
@@ -339,22 +356,29 @@ class OrderManager:
                 trade_result = {**self.trade_info,
                                 "exit_type": "TP",
                                 "exit_price": filled_price,
-                                "pnl": pnl}
+                                "pnl": pnl,
+                                "current_lot_size": self.dynamic_lot_size,
+                                "next_lot_size": self.lot_size}
                 log_trade_result(trade_result)
                 if self.monitor:
                     self.monitor.update_trade_result(trade_result)
                 log_json("TP_ORDER_FILLED", {
                     "trade_id": self.current_trade_id,
                     "position_size": size,
-                    "filled_price": filled_price
+                    "filled_price": filled_price,
+                    "consecutive_losses": self.consecutive_losses,
+                    "current_lot_size": self.dynamic_lot_size,
+                    "next_lot_size": self.lot_size
                 })
                 del self.tp_order_ids[size]
                 if size in self.sl_order_ids:
                     sl_order_id = self.sl_order_ids[size]
                     self._cancel_orders([sl_order_id])
                     del self.sl_order_ids[size]
+                # 利益が出たのでマーチンゲールをリセット
+                self.consecutive_losses = 0
                 self.dynamic_lot_size = self.lot_size
-                logger.info(f"Trade won. Lot size reset to: {self.dynamic_lot_size}")
+                logger.info(f"Trade won. Resetting martingale: consecutive_losses={self.consecutive_losses}, lot_size={self.dynamic_lot_size}")
                 self._save_trade_state()
                 self._clear_order_info()
                 # self.current_trade_id = None  # 修正: TP決済後も取引IDを維持
@@ -372,22 +396,29 @@ class OrderManager:
                 trade_result = {**self.trade_info,
                                 "exit_type": "SL",
                                 "exit_price": filled_price,
-                                "pnl": pnl}
+                                "pnl": pnl,
+                                "current_lot_size": self.dynamic_lot_size,
+                                "next_lot_size": math.ceil(self.dynamic_lot_size * self.martingale_factor)}
                 log_trade_result(trade_result)
                 if self.monitor:
                     self.monitor.update_trade_result(trade_result)
                 log_json("SL_ORDER_FILLED", {
                     "trade_id": self.current_trade_id,
                     "position_size": size,
-                    "filled_price": filled_price
+                    "filled_price": filled_price,
+                    "consecutive_losses": self.consecutive_losses,
+                    "current_lot_size": self.dynamic_lot_size,
+                    "next_lot_size": math.ceil(self.dynamic_lot_size * self.martingale_factor)
                 })
                 del self.sl_order_ids[size]
                 if size in self.tp_order_ids:
                     tp_order_id = self.tp_order_ids[size]
                     self._cancel_orders([tp_order_id])
                     del self.tp_order_ids[size]
+                # 損失が出たのでマーチンゲールを適用
+                self.consecutive_losses += 1
                 self.dynamic_lot_size = math.ceil(self.dynamic_lot_size * self.martingale_factor)
-                logger.info(f"Martingale applied. New lot size: {self.dynamic_lot_size}")
+                logger.info(f"Martingale applied. Consecutive losses: {self.consecutive_losses}, New lot size: {self.dynamic_lot_size}")
                 self._save_trade_state()
                 self._clear_order_info()
                 # self.current_trade_id = None  # 修正: SL決済後も取引IDを維持
@@ -517,6 +548,7 @@ class OrderManager:
             state = {
                 'trade_id': self.current_trade_id,
                 'dynamic_lot_size': self.dynamic_lot_size,
+                'consecutive_losses': self.consecutive_losses,  # 追加: 連続損失カウンター
                 'open_position_side': self.open_position_side,
                 'last_trade_time': time.time(),
                 'tp_order_ids': self.tp_order_ids,
@@ -525,7 +557,7 @@ class OrderManager:
             }
             with open(settings.TRADE_STATE_FILE, 'w') as f:
                 json.dump(state, f)
-            logger.debug(f"Saved trade state: ID={self.current_trade_id}, lot={self.dynamic_lot_size}")
+            logger.debug(f"Saved trade state: ID={self.current_trade_id}, lot={self.dynamic_lot_size}, consecutive_losses={self.consecutive_losses}")
         except Exception as e:
             logger.error(f"Failed to save trade state: {e}")
 
@@ -552,12 +584,13 @@ class OrderManager:
             return
         self.current_trade_id = saved_state.get('trade_id')
         self.dynamic_lot_size = saved_state.get('dynamic_lot_size', self.lot_size)
+        self.consecutive_losses = saved_state.get('consecutive_losses', 0)  # 追加: 連続損失カウンター
         self.open_position_side = saved_state.get('open_position_side')
         self.tp_order_ids = saved_state.get('tp_order_ids', {})
         self.sl_order_ids = saved_state.get('sl_order_ids', {})
         self.entry_price = saved_state.get('entry_price')
         self.last_trade_time = saved_state.get('last_trade_time', time.time())
-        logger.info(f"Restored trade state: ID={self.current_trade_id}, lot={self.dynamic_lot_size}")
+        logger.info(f"Restored trade state: ID={self.current_trade_id}, lot={self.dynamic_lot_size}, consecutive_losses={self.consecutive_losses}")
 
     def _is_state_reset_needed(self, saved_state):
         if not saved_state:
@@ -575,6 +608,7 @@ class OrderManager:
     def reset_martingale(self):
         logger.info("Resetting martingale counter")
         self.dynamic_lot_size = self.lot_size
+        self.consecutive_losses = 0  # 追加: 連続損失カウンターもリセット
         self.current_trade_id = None
         self.entry_order_id = None
         self.entry_price = None
@@ -587,6 +621,7 @@ class OrderManager:
                 state = {
                     'trade_id': None,
                     'dynamic_lot_size': self.lot_size,
+                    'consecutive_losses': 0,  # 追加: 連続損失カウンター
                     'last_trade_time': time.time(),
                     'reset_time': time.time()
                 }
