@@ -1,1 +1,1 @@
-{"trade_id": "T20250305_134704", "dynamic_lot_size": 8, "consecutive_losses": 3, "open_position_side": "SHORT", "last_trade_time": 1741182850.5265439, "tp_order_ids": {"8": 652266483254117376}, "sl_order_ids": {}, "entry_price": 89500.0}
+{"trade_id": "T20250305_140824", "dynamic_lot_size": 1.0, "consecutive_losses": 0, "open_position_side": "LONG", "last_trade_time": 1741223292.7000308, "tp_order_ids": {"1.0": 652436110168900608}, "sl_order_ids": {}, "entry_price": 90285.4}

@@ -263,13 +263,25 @@ class Strategy:
 
         # エントリー条件の判定
         if all_bullish and continuous_price_movement:
-            logger.info(
-                f"LONG entry condition met: All candles are bullish with price continuity. Slope: {slope_value:.4f} degrees")
-            return "LONG", slope_value  # 傾き値も返す
+            if not settings.DIRECTION_MATCH_CHECK or slope_value > 0:  # 一致チェックがOFFか、上昇トレンドの場合
+                logger.info(
+                    f"LONG entry condition met: All candles are bullish with price continuity. Slope: {slope_value:.4f} degrees")
+                if settings.DIRECTION_MATCH_CHECK and slope_value > 0:
+                    logger.info("Direction match check passed: Positive slope matches LONG direction")
+                return "LONG", slope_value
+            else:
+                logger.info(f"LONG entry skipped: Bullish candles but negative slope: {slope_value:.4f} degrees")
+                return None
         elif all_bearish and continuous_price_movement:
-            logger.info(
-                f"SHORT entry condition met: All candles are bearish with price continuity. Slope: {slope_value:.4f} degrees")
-            return "SHORT", slope_value  # 傾き値も返す
+            if not settings.DIRECTION_MATCH_CHECK or slope_value < 0:  # 一致チェックがOFFか、下降トレンドの場合
+                logger.info(
+                    f"SHORT entry condition met: All candles are bearish with price continuity. Slope: {slope_value:.4f} degrees")
+                if settings.DIRECTION_MATCH_CHECK and slope_value < 0:
+                    logger.info("Direction match check passed: Negative slope matches SHORT direction")
+                return "SHORT", slope_value
+            else:
+                logger.info(f"SHORT entry skipped: Bearish candles but positive slope: {slope_value:.4f} degrees")
+                return None
         else:
             return None
 

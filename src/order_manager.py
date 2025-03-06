@@ -279,12 +279,14 @@ class OrderManager:
             if status == "closed":
                 self.entry_order_id = None
                 logger.info("=" * 40)
-                logger.info(f"[ORDER FILLED] {self.open_position_side} at Price: {filled_price}, Position: {position_size}")
+                logger.info(
+                    f"[ORDER FILLED] {self.open_position_side} at Price: {filled_price}, Position: {position_size}")
                 logger.info("=" * 40)
                 self.trade_info["entry_price"] = filled_price
                 self.trade_info["trade_id"] = self.current_trade_id
                 self.trade_info["current_lot_size"] = self.dynamic_lot_size
-                self.trade_info["next_lot_size"] = math.ceil(self.dynamic_lot_size * self.martingale_factor) if self.consecutive_losses > 0 else self.lot_size
+                self.trade_info["next_lot_size"] = math.ceil(
+                    self.dynamic_lot_size * self.martingale_factor) if self.consecutive_losses > 0 else self.lot_size
                 log_json("ENTRY_FILLED", {
                     "trade_id": self.current_trade_id,
                     "side": self.open_position_side,
@@ -293,7 +295,8 @@ class OrderManager:
                     "order_timestamp": self.order_timestamp,
                     "consecutive_losses": self.consecutive_losses,
                     "current_lot_size": self.dynamic_lot_size,
-                    "next_lot_size": math.ceil(self.dynamic_lot_size * self.martingale_factor) if self.consecutive_losses > 0 else self.lot_size
+                    "next_lot_size": math.ceil(
+                        self.dynamic_lot_size * self.martingale_factor) if self.consecutive_losses > 0 else self.lot_size
                 })
                 self.entry_price = filled_price or 0
                 self._save_trade_state()
@@ -322,17 +325,45 @@ class OrderManager:
             logger.debug(f"TP order check - order_id: {tp_order_id}, status: {status}")
             if status == "canceled":
                 logger.info(f"TP order {tp_order_id} was canceled, removing from tracking")
-                if filled_price is not None:
-                    pnl = (filled_price - self.trade_info["entry_price"]) if self.open_position_side == "LONG" else \
-                          (self.trade_info["entry_price"] - filled_price)
-                else:
-                    pnl = None
-                trade_result = {**self.trade_info,
-                                "exit_type": "SL",
-                                "exit_price": filled_price,
-                                "pnl": pnl,
-                                "current_lot_size": self.dynamic_lot_size,
-                                "next_lot_size": math.ceil(self.dynamic_lot_size * self.martingale_factor)}
+                try:
+                    # entry_priceキーが存在するか確認し、なければエントリー価格を取得
+                    entry_price = self.trade_info.get("entry_price", self.entry_price)
+                    if entry_price is None:
+                        logger.error(
+                            f"Missing entry_price in trade_info during TP canceled processing: {self.trade_info}")
+                        entry_price = 0  # デフォルト値を設定
+
+                    if filled_price is not None:
+                        pnl = (filled_price - entry_price) if self.open_position_side == "LONG" else \
+                            (entry_price - filled_price)
+                    else:
+                        pnl = None
+
+                    # 欠けている可能性のあるtradeキーのデフォルト値を設定
+                    trade_info_copy = self.trade_info.copy() if hasattr(self, 'trade_info') and self.trade_info else {}
+                    if "entry_price" not in trade_info_copy and self.entry_price is not None:
+                        trade_info_copy["entry_price"] = self.entry_price
+                    if "direction" not in trade_info_copy and self.open_position_side:
+                        trade_info_copy["direction"] = self.open_position_side
+
+                    trade_result = {**trade_info_copy,
+                                    "exit_type": "SL",
+                                    "exit_price": filled_price,
+                                    "pnl": pnl,
+                                    "current_lot_size": self.dynamic_lot_size,
+                                    "next_lot_size": math.ceil(self.dynamic_lot_size * self.martingale_factor),
+                                    "trade_id": self.current_trade_id}
+                except Exception as e:
+                    logger.error(f"Error processing canceled TP order: {e}")
+                    trade_result = {
+                        "exit_type": "SL",
+                        "exit_price": filled_price,
+                        "current_lot_size": self.dynamic_lot_size,
+                        "next_lot_size": math.ceil(self.dynamic_lot_size * self.martingale_factor),
+                        "trade_id": self.current_trade_id,
+                        "direction": self.open_position_side
+                    }
+
                 log_trade_result(trade_result)
                 if self.monitor:
                     self.monitor.update_trade_result(trade_result)
@@ -344,21 +375,50 @@ class OrderManager:
                 # 損失が出たのでマーチンゲールを適用
                 self.consecutive_losses += 1
                 self.dynamic_lot_size = math.ceil(self.dynamic_lot_size * self.martingale_factor)
-                logger.info(f"Martingale applied. Consecutive losses: {self.consecutive_losses}, New lot size: {self.dynamic_lot_size}")
+                logger.info(
+                    f"Martingale applied. Consecutive losses: {self.consecutive_losses}, New lot size: {self.dynamic_lot_size}")
                 self._save_trade_state()
                 continue
+
             if status == "closed":
                 logger.info("=" * 40)
                 logger.info(f"[TP ORDER FILLED] Size: {size}, Filled Price: {filled_price}")
                 logger.info("=" * 40)
-                pnl = (filled_price - self.trade_info["entry_price"]) if self.open_position_side == "LONG" else \
-                      (self.trade_info["entry_price"] - filled_price)
-                trade_result = {**self.trade_info,
-                                "exit_type": "TP",
-                                "exit_price": filled_price,
-                                "pnl": pnl,
-                                "current_lot_size": self.dynamic_lot_size,
-                                "next_lot_size": self.lot_size}
+                try:
+                    # entry_priceキーが存在するか確認し、なければエントリー価格を取得
+                    entry_price = self.trade_info.get("entry_price", self.entry_price)
+                    if entry_price is None:
+                        logger.error(f"Missing entry_price in trade_info during TP fill processing: {self.trade_info}")
+                        entry_price = 0  # デフォルト値を設定
+
+                    pnl = (filled_price - entry_price) if self.open_position_side == "LONG" else \
+                        (entry_price - filled_price)
+
+                    # 欠けている可能性のあるtradeキーのデフォルト値を設定
+                    trade_info_copy = self.trade_info.copy() if hasattr(self, 'trade_info') and self.trade_info else {}
+                    if "entry_price" not in trade_info_copy and self.entry_price is not None:
+                        trade_info_copy["entry_price"] = self.entry_price
+                    if "direction" not in trade_info_copy and self.open_position_side:
+                        trade_info_copy["direction"] = self.open_position_side
+
+                    trade_result = {**trade_info_copy,
+                                    "exit_type": "TP",
+                                    "exit_price": filled_price,
+                                    "pnl": pnl,
+                                    "current_lot_size": self.dynamic_lot_size,
+                                    "next_lot_size": self.lot_size,
+                                    "trade_id": self.current_trade_id}
+                except Exception as e:
+                    logger.error(f"Error processing TP order fill: {e}")
+                    trade_result = {
+                        "exit_type": "TP",
+                        "exit_price": filled_price,
+                        "current_lot_size": self.dynamic_lot_size,
+                        "next_lot_size": self.lot_size,
+                        "trade_id": self.current_trade_id,
+                        "direction": self.open_position_side
+                    }
+
                 log_trade_result(trade_result)
                 if self.monitor:
                     self.monitor.update_trade_result(trade_result)
@@ -378,7 +438,8 @@ class OrderManager:
                 # 利益が出たのでマーチンゲールをリセット
                 self.consecutive_losses = 0
                 self.dynamic_lot_size = self.lot_size
-                logger.info(f"Trade won. Resetting martingale: consecutive_losses={self.consecutive_losses}, lot_size={self.dynamic_lot_size}")
+                logger.info(
+                    f"Trade won. Resetting martingale: consecutive_losses={self.consecutive_losses}, lot_size={self.dynamic_lot_size}")
                 self._save_trade_state()
                 self._clear_order_info()
                 # self.current_trade_id = None  # 修正: TP決済後も取引IDを維持
@@ -391,14 +452,41 @@ class OrderManager:
                 logger.info("=" * 40)
                 logger.info(f"[SL ORDER FILLED] Size: {size}, Filled Price: {filled_price}")
                 logger.info("=" * 40)
-                pnl = (filled_price - self.trade_info["entry_price"]) if self.open_position_side == "LONG" else \
-                      (self.trade_info["entry_price"] - filled_price)
-                trade_result = {**self.trade_info,
-                                "exit_type": "SL",
-                                "exit_price": filled_price,
-                                "pnl": pnl,
-                                "current_lot_size": self.dynamic_lot_size,
-                                "next_lot_size": math.ceil(self.dynamic_lot_size * self.martingale_factor)}
+                try:
+                    # entry_priceキーが存在するか確認し、なければエントリー価格を取得
+                    entry_price = self.trade_info.get("entry_price", self.entry_price)
+                    if entry_price is None:
+                        logger.error(f"Missing entry_price in trade_info during SL fill processing: {self.trade_info}")
+                        entry_price = 0  # デフォルト値を設定
+
+                    pnl = (filled_price - entry_price) if self.open_position_side == "LONG" else \
+                        (entry_price - filled_price)
+
+                    # 欠けている可能性のあるtradeキーのデフォルト値を設定
+                    trade_info_copy = self.trade_info.copy() if hasattr(self, 'trade_info') and self.trade_info else {}
+                    if "entry_price" not in trade_info_copy and self.entry_price is not None:
+                        trade_info_copy["entry_price"] = self.entry_price
+                    if "direction" not in trade_info_copy and self.open_position_side:
+                        trade_info_copy["direction"] = self.open_position_side
+
+                    trade_result = {**trade_info_copy,
+                                    "exit_type": "SL",
+                                    "exit_price": filled_price,
+                                    "pnl": pnl,
+                                    "current_lot_size": self.dynamic_lot_size,
+                                    "next_lot_size": math.ceil(self.dynamic_lot_size * self.martingale_factor),
+                                    "trade_id": self.current_trade_id}
+                except Exception as e:
+                    logger.error(f"Error processing SL order fill: {e}")
+                    trade_result = {
+                        "exit_type": "SL",
+                        "exit_price": filled_price,
+                        "current_lot_size": self.dynamic_lot_size,
+                        "next_lot_size": math.ceil(self.dynamic_lot_size * self.martingale_factor),
+                        "trade_id": self.current_trade_id,
+                        "direction": self.open_position_side
+                    }
+
                 log_trade_result(trade_result)
                 if self.monitor:
                     self.monitor.update_trade_result(trade_result)
@@ -418,7 +506,8 @@ class OrderManager:
                 # 損失が出たのでマーチンゲールを適用
                 self.consecutive_losses += 1
                 self.dynamic_lot_size = math.ceil(self.dynamic_lot_size * self.martingale_factor)
-                logger.info(f"Martingale applied. Consecutive losses: {self.consecutive_losses}, New lot size: {self.dynamic_lot_size}")
+                logger.info(
+                    f"Martingale applied. Consecutive losses: {self.consecutive_losses}, New lot size: {self.dynamic_lot_size}")
                 self._save_trade_state()
                 self._clear_order_info()
                 # self.current_trade_id = None  # 修正: SL決済後も取引IDを維持
@@ -461,13 +550,13 @@ class OrderManager:
 
     def _clear_order_info(self):
         self.entry_order_id = None
-        self.entry_price = None
         self.order_timestamp = None
         self.order_lock_until = time.time() + 5
         self.tp_order_ids = {}
         self.sl_order_ids = {}
         self._clear_local_cache()
         self._filled_logged = False
+        # self.trade_info = {}  # この行があれば削除または修正
         # self.open_position_side = None  # 修正: ポジション方向を維持
 
     def _clear_local_cache(self):

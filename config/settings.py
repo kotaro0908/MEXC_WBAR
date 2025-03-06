@@ -17,6 +17,9 @@ class Settings:
     # 新しい戦略パラメーター：連続ローソク足の本数
     CONSECUTIVE_CANDLES = int(os.getenv("CONSECUTIVE_CANDLES", 2))
 
+    # 新しい戦略パラメーター：傾きと方向の一致チェック
+    DIRECTION_MATCH_CHECK = os.getenv("DIRECTION_MATCH_CHECK", "FALSE").upper() == "TRUE"
+
     # TP/SLの設定
     TP_AMOUNT = float(os.getenv("TP_AMOUNT", 0.00003))
     SL_AMOUNT = float(os.getenv("SL_AMOUNT", 0.02))
