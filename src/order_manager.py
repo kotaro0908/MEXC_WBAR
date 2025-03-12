@@ -182,7 +182,7 @@ class OrderManager:
             "symbol": self.ws_symbol,
             "side": order_side,
             "openType": 2,
-            "type": "5",  # 成行注文
+            "type": "6",  # 成行注文
             "vol": str(round(self.dynamic_lot_size, 3)),
             "leverage": self.leverage,
             "priceProtect": "0",
