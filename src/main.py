@@ -7,6 +7,7 @@ from src.order_manager import OrderManager
 from src.monitor import BotMonitor  # 監視モジュール
 from utils.logger import get_logger
 import pandas as pd
+from utils.log_utils import flush_s3_logs
 
 logger = get_logger(__name__)
 
@@ -138,6 +139,10 @@ async def main():
                 await data_task
             except asyncio.CancelledError:
                 pass
+
+            # S3ログバッファをフラッシュ
+        flush_s3_logs()
+        logger.info("S3 logs flushed during shutdown")
 
 
 if __name__ == "__main__":

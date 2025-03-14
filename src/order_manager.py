@@ -131,15 +131,15 @@ class OrderManager:
         return False
 
     async def place_entry_order(self, side: str, trigger_price: float, trade_info: dict = None):
+        print(f"DEBUG: Starting place_entry_order - side={side}, trigger_price={trigger_price}")
         if self.has_open_position_or_order():
             logger.info("Already have position or open order, skipping new entry")
+            print("DEBUG: Skipping entry due to existing position/order")
             return
-
         # 方向転換時のロットサイズリセット処理 - 削除 (マーチンゲールを方向に関係なく適用)
-
         # 現在のマーチンゲール状態をログに出力
-        logger.info(f"Placing {side} order with size {self.dynamic_lot_size} (consecutive losses: {self.consecutive_losses})")
-
+        logger.info(
+            f"Placing {side} order with size {self.dynamic_lot_size} (consecutive losses: {self.consecutive_losses})")
         order_size = self.dynamic_lot_size
         if self.current_trade_id is None:
             # 永続化が有効なら復元済み状態を使用、なければ新規生成
@@ -150,7 +150,8 @@ class OrderManager:
                     self.dynamic_lot_size = saved_state.get('dynamic_lot_size', self.lot_size)
                     self.consecutive_losses = saved_state.get('consecutive_losses', 0)  # 追加
                     self.open_position_side = saved_state.get('open_position_side')
-                    logger.info(f"Restored trade state: ID={self.current_trade_id}, lot={self.dynamic_lot_size}, consecutive_losses={self.consecutive_losses}")
+                    logger.info(
+                        f"Restored trade state: ID={self.current_trade_id}, lot={self.dynamic_lot_size}, consecutive_losses={self.consecutive_losses}")
                 else:
                     self.current_trade_id = f"T{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
             else:
@@ -158,25 +159,28 @@ class OrderManager:
         self.open_position_side = side
         self.trade_info = trade_info or {}
         self.last_trade_time = time.time()
-
         price_precision = 1
         if side == "SHORT":
             order_side = 3
             sl_price = round(trigger_price + self.trade_logic.offset_sl, price_precision)
-            tp_price = round(trigger_price - self.trade_logic.offset_tp, price_precision)
+            # トリガー価格ベースのTP計算は削除
+            # tp_price = round(trigger_price - self.trade_logic.offset_tp, price_precision)
         else:
             order_side = 1
             sl_price = round(trigger_price - self.trade_logic.offset_sl, price_precision)
-            tp_price = round(trigger_price + self.trade_logic.offset_tp, price_precision)
-
+            # トリガー価格ベースのTP計算は削除
+            # tp_price = round(trigger_price + self.trade_logic.offset_tp, price_precision)
         self.trade_info["stop_loss_price"] = sl_price
-        self.trade_info["take_profit_price"] = tp_price
+        # トリガー価格ベースのTP設定は削除
+        # self.trade_info["take_profit_price"] = tp_price
+        # 代わりにトリガー価格を保存
+        self.trade_info["trigger_price"] = trigger_price
         # 追加: 現在のロットサイズと次回予測ロットサイズを記録
         self.trade_info["current_lot_size"] = self.dynamic_lot_size
-        self.trade_info["next_lot_size"] = math.ceil(self.dynamic_lot_size * self.martingale_factor) if self.consecutive_losses > 0 else self.lot_size
+        self.trade_info["next_lot_size"] = math.ceil(
+            self.dynamic_lot_size * self.martingale_factor) if self.consecutive_losses > 0 else self.lot_size
         self.trade_info["consecutive_losses"] = self.consecutive_losses
         self.trade_info["martingale_factor"] = self.martingale_factor
-
         # ※TP注文は除外し、SLのみエントリー注文に付与
         params = {
             "symbol": self.ws_symbol,
@@ -189,34 +193,79 @@ class OrderManager:
             "stopLossPrice": f"{sl_price}"
             # takeProfitPrice はここでは指定しない
         }
-
         logger.debug(f"Placing entry order: Size {round(self.dynamic_lot_size, 3)}, SL {sl_price}")
+        print(f"DEBUG: Entry order parameters: {params}")
         response = self._place_order(params)
+        print(f"DEBUG: Entry order response: {response}")
         if response and response.get("success"):
             self.entry_order_id = response["data"]
             self.order_timestamp = datetime.utcnow().isoformat()
             self.order_lock_until = time.time() + 5
             logger.info("=" * 40)
-            logger.info(f"[ORDER PLACED] {side} Entry - Size: {round(self.dynamic_lot_size, 3)}, SL: {sl_price}, Consecutive Losses: {self.consecutive_losses}")
+            logger.info(
+                f"[ORDER PLACED] {side} Entry - Size: {round(self.dynamic_lot_size, 3)}, SL: {sl_price}, Consecutive Losses: {self.consecutive_losses}")
             logger.info("=" * 40)
             logger.info("Waiting 5 seconds for entry order confirmation...")
             self._save_trade_state()
             await asyncio.sleep(3)
+            # 約定確認と詳細なログ追加
+            print(f"DEBUG: Checking if entry order {self.entry_order_id} is filled")
             status, filled_price = self._check_order_filled_retry(self.entry_order_id, max_retries=3, sleep_sec=2)
+            print(f"DEBUG: Entry order status: {status}, filled_price: {filled_price}")
+
+            # 詳細なログを追加
+            logger.info(
+                f"Entry order status check: status={status}, filled_price={filled_price}, trigger_price={trigger_price}")
+            if filled_price and abs(filled_price - trigger_price) > 0.001:
+                logger.warning(
+                    f"Price slippage detected: trigger={trigger_price}, filled={filled_price}, diff={filled_price - trigger_price}")
+
             if status != "closed":
                 logger.error(f"Entry order not confirmed. Status: {status}")
+                print(f"DEBUG: Entry order not confirmed. Exiting.")
                 return
+
             logger.info("Entry order confirmed. Now placing TP order separately...")
-            # TP注文はエントリー確定後に別途発注する
-            tp_success = await self.place_take_profit_order(self.dynamic_lot_size, filled_price)
-            if tp_success:
-                logger.info("TP order placed successfully.")
-            else:
-                logger.warning("TP order placement failed.")
+            print("=" * 50)
+            print(f"DEBUG: ENTRY ORDER CONFIRMED. ABOUT TO PLACE TP ORDER")
+            print("=" * 50)
+
+            # TP注文はエントリー確定後に別途発注する - 強化されたエラーハンドリング
+            try:
+                print(
+                    f"DEBUG: Calling place_take_profit_order with size={self.dynamic_lot_size}, filled_price={filled_price}")
+                logger.info(
+                    f"Calling place_take_profit_order with size={self.dynamic_lot_size}, filled_price={filled_price}")
+                tp_success = await self.place_take_profit_order(self.dynamic_lot_size, filled_price)
+                print(f"DEBUG: place_take_profit_order returned: {tp_success}")
+
+                if tp_success:
+                    logger.info("TP order placed successfully.")
+                    print("DEBUG: TP order placed successfully.")
+                else:
+                    logger.warning("TP order placement failed. Will retry in check_orders_status.")
+                    print("DEBUG: TP order placement failed. Will retry later.")
+                    # 失敗した場合のリトライフラグを設定
+                    self.trade_info["tp_order_retry_needed"] = True
+                    self.trade_info["tp_filled_price"] = filled_price
+            except Exception as e:
+                logger.error(f"Error during TP order placement: {e}", exc_info=True)
+                print(f"DEBUG: CRITICAL ERROR IN TP ORDER: {str(e)}")
+                # 例外発生時もリトライフラグを設定
+                self.trade_info["tp_order_retry_needed"] = True
+                self.trade_info["tp_filled_price"] = filled_price
+
+            print("=" * 50)
+            print(f"DEBUG: TP ORDER PROCESS COMPLETED")
+            print("=" * 50)
+
             self._save_trade_state()
             await asyncio.sleep(2)
         else:
             logger.error(f"Failed to place entry order: {response}")
+            print(f"DEBUG: Failed to place entry order: {response}")
+
+        print(f"DEBUG: Exiting place_entry_order")
 
     async def place_stop_loss_order(self, position_size: float, entry_price: float):
         # ※既にエントリー注文に SL が付いている場合は、個別発注不要
@@ -224,53 +273,118 @@ class OrderManager:
         return True
 
     async def place_take_profit_order(self, position_size: float, filled_price: float):
-        if position_size in self.tp_order_ids:
-            logger.debug(f"TP Skip - Order exists for size: {position_size}")
-            return True
+        print(f"DEBUG: Starting place_take_profit_order - position_size={position_size}, filled_price={filled_price}")
+        try:
+            logger.info(f"Attempting to place TP order: position_size={position_size}, filled_price={filled_price}")
 
-        if position_size <= 0:
-            logger.debug(f"TP Skip - Invalid size: {position_size}")
+            if position_size in self.tp_order_ids:
+                logger.debug(f"TP Skip - Order exists for size: {position_size}")
+                print(f"DEBUG: TP Skip - Order already exists for size: {position_size}")
+                return True
+
+            if position_size <= 0:
+                logger.warning(f"TP Skip - Invalid size: {position_size}")
+                print(f"DEBUG: TP Skip - Invalid size: {position_size}")
+                return False
+
+            price_precision = 1
+            if self.open_position_side == "SHORT":
+                tp_price = round(filled_price - self.trade_logic.offset_tp, price_precision)
+                close_side = 2
+            else:
+                tp_price = round(filled_price + self.trade_logic.offset_tp, price_precision)
+                close_side = 4
+
+            # TP計算の詳細ログを追加
+            logger.info(
+                f"TP calculation: filled_price={filled_price}, offset_tp={self.trade_logic.offset_tp}, calculated_tp={tp_price}")
+            print(
+                f"DEBUG: TP calculation: filled_price={filled_price}, offset_tp={self.trade_logic.offset_tp}, calculated_tp={tp_price}")
+
+            logger.debug(
+                f"TP Order Details - Side: {self.open_position_side}, Close Side: {close_side}, Price: {tp_price}")
+
+            tp_params = {
+                "symbol": self.ws_symbol,
+                "side": close_side,
+                "openType": 2,
+                "type": "2",  # ポストオンリー注文
+                "vol": str(position_size),
+                "leverage": self.leverage,
+                "price": f"{tp_price}",
+                "priceProtect": "0"
+            }
+
+            # 詳細なデバッグログを追加
+            logger.debug(f"TP Order Parameters: {tp_params}")
+            print(f"DEBUG: TP Order Parameters: {tp_params}")
+            logger.info(
+                f"Placing TP order at price: {tp_price} (filled_price: {filled_price}, offset: {self.trade_logic.offset_tp})")
+
+            max_attempts = 3
+            attempt = 0
+            tp_success = False
+
+            while attempt < max_attempts and not tp_success:
+                logger.info(f"TP order attempt {attempt + 1}/{max_attempts}")
+                print(f"DEBUG: TP order attempt {attempt + 1}/{max_attempts}")
+                tp_response = self._place_order(tp_params)
+                logger.info(f"TP order API response: {tp_response}")
+                print(f"DEBUG: TP order API response: {tp_response}")
+
+                if tp_response and tp_response.get("success"):
+                    self.tp_order_ids[position_size] = tp_response["data"]
+                    # 実際のTP価格を保存
+                    self.trade_info["actual_take_profit_price"] = tp_price
+                    # トリガー価格との差異をログに記録
+                    trigger_based_tp = self.trade_info.get("take_profit_price")
+                    if trigger_based_tp and abs(trigger_based_tp - tp_price) > 0.001:
+                        logger.warning(f"TP price discrepancy: trigger-based={trigger_based_tp}, actual={tp_price}")
+                        print(f"DEBUG: TP price discrepancy: trigger-based={trigger_based_tp}, actual={tp_price}")
+
+                    logger.info(
+                        f"[TP ORDER PLACED] Size: {position_size}, Price: {tp_price}, Order ID: {tp_response['data']}")
+                    print(
+                        f"DEBUG: TP ORDER PLACED! Size: {position_size}, Price: {tp_price}, Order ID: {tp_response['data']}")
+                    tp_success = True
+                else:
+                    error_msg = tp_response.get("msg", "Unknown error") if tp_response else "No response"
+                    logger.warning(f"TP order failed on attempt {attempt + 1}: {error_msg}. Retrying after delay.")
+                    print(f"DEBUG: TP order failed on attempt {attempt + 1}: {error_msg}. Retrying after delay.")
+                    await asyncio.sleep(1)
+                    attempt += 1
+
+            if not tp_success:
+                logger.error(f"All TP order attempts failed after {max_attempts} tries")
+                print(f"DEBUG: All TP order attempts failed after {max_attempts} tries")
+
+            print(f"DEBUG: Exiting place_take_profit_order with result: {tp_success}")
+            return tp_success
+
+        except Exception as e:
+            logger.error(f"Exception in place_take_profit_order: {e}", exc_info=True)
+            print(f"DEBUG: CRITICAL EXCEPTION in place_take_profit_order: {str(e)}")
+            import traceback
+            print(f"DEBUG: Traceback: {traceback.format_exc()}")
             return False
 
-        price_precision = 1
-        if self.open_position_side == "SHORT":
-            tp_price = round(filled_price - self.trade_logic.offset_tp, price_precision)
-            close_side = 2
-        else:
-            tp_price = round(filled_price + self.trade_logic.offset_tp, price_precision)
-            close_side = 4
-
-        logger.debug(f"TP Order Details - Side: {self.open_position_side}, Close Side: {close_side}, Price: {tp_price}")
-
-        tp_params = {
-            "symbol": self.ws_symbol,
-            "side": close_side,
-            "openType": 2,
-            "type": "2",  # ポストオンリー注文
-            "vol": str(position_size),
-            "leverage": self.leverage,
-            "price": f"{tp_price}",
-            "priceProtect": "0"
-        }
-
-        logger.debug(f"TP Order Parameters: {tp_params}")
-
-        max_attempts = 3
-        attempt = 0
-        tp_success = False
-        while attempt < max_attempts and not tp_success:
-            tp_response = self._place_order(tp_params)
-            if tp_response and tp_response.get("success"):
-                self.tp_order_ids[position_size] = tp_response["data"]
-                logger.info(f"[TP ORDER PLACED] Size: {position_size}, Price: {tp_price}")
-                tp_success = True
-            else:
-                logger.warning(f"TP order failed on attempt {attempt+1}: {tp_response}. Retrying after delay.")
-                await asyncio.sleep(1)
-                attempt += 1
-        return tp_success
-
     async def check_orders_status(self):
+        # TP注文のリトライが必要な場合
+        if self.trade_info.get("tp_order_retry_needed") and self.trade_info.get("tp_filled_price"):
+            logger.info("Retrying TP order placement from previous failed attempt")
+            filled_price = self.trade_info.get("tp_filled_price")
+            try:
+                tp_success = await self.place_take_profit_order(self.dynamic_lot_size, filled_price)
+                if tp_success:
+                    logger.info("TP order retry successful.")
+                    self.trade_info.pop("tp_order_retry_needed", None)
+                    self.trade_info.pop("tp_filled_price", None)
+                else:
+                    logger.warning("TP order retry failed again.")
+            except Exception as e:
+                logger.error(f"Error during TP order retry: {e}", exc_info=True)
+
+        # 以下は既存のコード
         if self.entry_order_id:
             status, filled_price = self._check_order_filled_retry(
                 order_id=self.entry_order_id, max_retries=5, sleep_sec=3)
@@ -614,9 +728,27 @@ class OrderManager:
                 "x-mxc-sign": sign_info["sign"],
                 "x-mxc-nonce": sign_info["time"]
             }
+            logger.debug(f"Sending API request to {self.ORDER_URL} with params: {param_json}")
             resp = requests.post(self.ORDER_URL, headers=headers, json=param_json)
+
+            # レスポンスの詳細をログに記録
+            logger.debug(f"API response status: {resp.status_code}")
+            if resp.status_code != 200:
+                logger.error(f"API error: {resp.status_code} - {resp.text}")
+
             resp.raise_for_status()
-            return resp.json()
+            response_data = resp.json()
+            logger.debug(f"API response data: {response_data}")
+            return response_data
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error in _place_order: {e}")
+            try:
+                error_response = e.response.json()
+                logger.error(f"API error response: {error_response}")
+            except:
+                logger.error(
+                    f"Could not parse error response: {e.response.text if hasattr(e, 'response') else 'No response'}")
+            return None
         except Exception as e:
             logger.error(f"_place_order failed: {e}")
             return None
