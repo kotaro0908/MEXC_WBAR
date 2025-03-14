@@ -21,8 +21,8 @@ class Settings:
     DIRECTION_MATCH_CHECK = os.getenv("DIRECTION_MATCH_CHECK", "FALSE").upper() == "TRUE"
 
     # TP/SLの設定
-    TP_AMOUNT = float(os.getenv("TP_AMOUNT", 0.00003))
-    SL_AMOUNT = float(os.getenv("SL_AMOUNT", 0.02))
+    TP_AMOUNT = float(os.getenv("TP_AMOUNT", 0.3))
+    SL_AMOUNT = float(os.getenv("SL_AMOUNT", 0.3))
     ORDER_TIMEOUT_SEC = int(os.getenv("ORDER_TIMEOUT_SEC", 300))
 
     # システム設定
