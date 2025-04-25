@@ -1,66 +1,46 @@
 from __future__ import annotations
 """
-run_bot.py – main async event loop that wires together Strategy, OrderManager,
-DataHandler (thin wrapper around exchange websocket / rest), and OrderMonitor.
+run_bot.py – launch the bot with real-time WebSocket ticks → 1-second bars.
 
-Usage::
-    python run_bot.py  # .env must be configured
+構成:
+    DataHandlerWS  : MEXC `public.deal` を購読して 1-秒 OHLCV を生成
+    Strategy       : エントリー判定
+    OrderManager   : 発注 & マーチン管理
+    OrderMonitor   : TP/SL 約定監視
 
-Stop with Ctrl‑C.
+起動:
+    python run_bot.py   （事前に .env を設定）
 """
 
 import asyncio
 import signal
-from datetime import datetime
+from types import SimpleNamespace
+
+import ccxt
 
 from config.settings import settings
 from utils.logger import get_logger
-
 from src.strategy import Strategy
 from src.order_manager import OrderManager
 from src.order_monitor import OrderMonitor
+from src.data_handler_ws import DataHandlerWS
 
 logger = get_logger(__name__)
 
-################################################################################
-# Dummy minimal DataHandler (placeholder)
-################################################################################
-
-class DataHandler:
-    """Grabs latest 1‑min klines via ccxt fetch_ohlcv. Replace with WS in prod."""
-
-    def __init__(self, exchange, symbol: str):
-        self.exchange = exchange
-        self.symbol = symbol
-
-    async def poll(self):
-        # fetch last closed kline (1m)
-        ohlcvs = self.exchange.fetch_ohlcv(self.symbol, timeframe="1m", limit=2)
-        ts, o, h, l, c, v = ohlcvs[-2]  # last closed bar
-        return {
-            "timestamp": datetime.utcfromtimestamp(ts / 1_000).isoformat(),
-            "open": o,
-            "high": h,
-            "low": l,
-            "close": c,
-            "vol": v,
-            "is_confirmed": True,
-        }
 
 ################################################################################
-# Main loop helpers
+# メイン async 関数
 ################################################################################
-
-async def run_bot():
-    import ccxt  # local import to avoid unused when testing
-
-    ex = ccxt.mexc({
+async def run_bot() -> None:
+    # ── REST exchange (発注・口座情報用) ───────────────────────────────
+    exchange = ccxt.mexc({
         "apiKey": settings.API_KEY,
         "secret": settings.API_SECRET,
         "options": {"defaultType": "future", "recvWindow": 60000},
         "enableRateLimit": True,
     })
 
+    # ── Core modules ─────────────────────────────────────────────────
     strategy = Strategy()
     om = OrderManager(
         trade_logic=strategy,
@@ -73,45 +53,53 @@ async def run_bot():
         api_secret=settings.API_SECRET,
     )
     monitor = OrderMonitor(om)
-    data_handler = DataHandler(ex, settings.CCXT_SYMBOL)
 
+    # Strategy.evaluate_and_execute が data_handler.get_confirmed_data を呼ぶため
+    dummy_dh = SimpleNamespace(get_confirmed_data=lambda: None)
+
+    # ── callback: 1-秒バーを受け取るたび実行 ───────────────────────
+    async def on_bar(bar: dict):
+        strategy.update_market_data(bar)
+        await strategy.evaluate_and_execute(om, dummy_dh)
+        await monitor.run()
+
+    # WebSocket DataHandler
+    dh_ws = DataHandlerWS(settings.WS_SYMBOL, on_bar)
+
+    # ── Graceful shutdown ───────────────────────────────────────────
     stop_event = asyncio.Event()
 
-    def _signal_handler():
-        logger.warning("Received stop signal – shutting down...")
+    def _stop():
+        logger.warning("Received stop signal – shutting down…")
         stop_event.set()
 
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            asyncio.get_running_loop().add_signal_handler(sig, _signal_handler)
-        except NotImplementedError:
-            # Windows event loop
-            signal.signal(sig, lambda *_: _signal_handler())
+            loop.add_signal_handler(sig, _stop)
+        except NotImplementedError:          # Windows
+            signal.signal(sig, lambda *_: _stop())
 
-    logger.info("=== BOT STARTED ===")
+    logger.info("=== BOT STARTED (WebSocket mode) ===")
 
-    while not stop_event.is_set():
-        try:
-            # 1) poll market data & feed into strategy
-            md = await data_handler.poll()
-            strategy.update_market_data(md)
+    # run DataHandlerWS until stop_event is triggered
+    ws_task = asyncio.create_task(dh_ws.run())
 
-            # 2) evaluate strategy
-            await strategy.evaluate_and_execute(om, data_handler)
-
-            # 3) monitor open orders / positions
-            await monitor.run()
-
-        except Exception as e:
-            logger.error(f"main loop error: {e}", exc_info=True)
-
-        await asyncio.sleep(settings.POLLING_INTERVAL)
+    await stop_event.wait()
+    ws_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await ws_task
 
     logger.info("=== BOT EXIT ===")
 
-################################################################################
-# entry‑point
-################################################################################
 
+################################################################################
+# entry-point
+################################################################################
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    import contextlib
+
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        pass
