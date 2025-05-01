@@ -1,0 +1,9 @@
+{"timestamp": "2025-04-25T06:05:07.547277+00:00", "event_type": "ENTRY_FILLED", "trade_id": "T20250425_060505", "side": "LONG", "price": 100.0, "size": 2.0}
+{"timestamp": "2025-04-25T06:05:09.781229+00:00", "event_type": "ENTRY_FILLED", "trade_id": "T20250425_060505", "side": "SHORT", "price": 100.0, "size": 2.0}
+{"timestamp": "2025-04-25T06:06:20.768144+00:00", "event_type": "ENTRY_FILLED", "trade_id": "T20250425_060505", "side": "LONG", "price": 100.0, "size": 2.0}
+{"timestamp": "2025-04-25T06:06:23.008383+00:00", "event_type": "ENTRY_FILLED", "trade_id": "T20250425_060505", "side": "SHORT", "price": 100.0, "size": 2.0}
+{"timestamp": "2025-04-25T06:06:23.009899+00:00", "event_type": "TRADE_RESULT", "trade_id": "T20250425_060505", "exit_type": "SL", "exit_price": 100.15, "pnl": -0.15000000000000568, "current_lot_size": 2.0, "direction": "SHORT"}
+{"timestamp": "2025-04-25T06:10:03.689935+00:00", "event_type": "ENTRY_FILLED", "trade_id": "T20250425_060505", "side": "LONG", "price": 100.0, "size": 4.0}
+{"timestamp": "2025-04-25T06:10:03.692147+00:00", "event_type": "TRADE_RESULT", "trade_id": "T20250425_060505", "exit_type": "TP", "exit_price": 100.15, "pnl": 0.15000000000000568, "current_lot_size": 4.0, "direction": "LONG"}
+{"timestamp": "2025-04-25T06:10:05.719222+00:00", "event_type": "ENTRY_FILLED", "trade_id": "T20250425_060505", "side": "SHORT", "price": 100.0, "size": 2.0}
+{"timestamp": "2025-04-25T06:10:05.721350+00:00", "event_type": "TRADE_RESULT", "trade_id": "T20250425_060505", "exit_type": "SL", "exit_price": 100.15, "pnl": -0.15000000000000568, "current_lot_size": 2.0, "direction": "SHORT"}
