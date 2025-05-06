@@ -11,8 +11,7 @@ from utils.logger import get_logger
 from utils.log_utils import log_json, log_trade_result
 
 if TYPE_CHECKING:          # 型チェック用（循環 import 回避）
-    from src.order_manager import OrderManager
-    from src.notifier import Notifier
+    from src.core.order_manager import OrderManager
 
 logger = get_logger(__name__)
 

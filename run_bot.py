@@ -33,8 +33,8 @@ if sys.platform == "win32":
 # ─ 内部 import
 from config.settings import settings
 from utils.logger     import get_logger
-from src.strategy     import Strategy
-from src.order_manager import OrderManager
+from src.core.strategy import Strategy
+from src.core.order_manager import OrderManager
 from src.order_monitor import OrderMonitor
 from src.notifier      import Notifier
 

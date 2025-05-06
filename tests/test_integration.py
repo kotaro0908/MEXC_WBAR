@@ -1,4 +1,3 @@
-import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -6,8 +5,8 @@ import pytest_asyncio
 
 # project modules
 from config.settings import settings
-from src.strategy import Strategy
-from src.order_manager import OrderManager
+from src.core.strategy import Strategy
+from src.core.order_manager import OrderManager
 from src.order_monitor import OrderMonitor
 
 ################################################################################
