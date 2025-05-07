@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
-CSV が置いてあれば簡単に最適化を走らせるラッパー
+CLI ラッパー : 引数をそのまま src.research.optimize に渡す
 """
 
-import subprocess
+import runpy
 import sys
-from pathlib import Path
 
-CSV_PATH = Path("data") / "ohlcv_1m.csv"  # 適宜変更
-
-cmd = [
-    sys.executable,
-    "-m",
-    "src.research.optimize",
-    "--csv",
-    str(CSV_PATH),
-    "--trials",
-    "20",
-    "--windows",
-    "3",
-]
-subprocess.call(cmd)
+if __name__ == "__main__":
+    # sys.argv[0] を疑似的にモジュールパスへ書き換え
+    sys.argv[0] = "src.research.optimize"
+    # そのまま実行
+    runpy.run_module("src.research.optimize", run_name="__main__")
