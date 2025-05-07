@@ -1,165 +1,157 @@
+#!/usr/bin/env python3
+"""
+run_bot.py
+==========
+
+MEXC_WBAR のライブ実行エントリ。
+
+■ 主な役割
+1. 環境変数・設定読み込み
+2. DataHandler1m で 1 分足をストリーム取得
+3. WBARSimpleStrategy でシグナル判定→OrderManager 経由で市場注文
+4. WSListener で TP / SL fill を検知し StatsTracker / RiskGuard へ伝搬
+5. stop_event が立ったら安全にシャットダウン
+
+※ Windows では SelectorEventLoop を明示（Py3.12 互換）
+"""
+
 from __future__ import annotations
-"""
-run_bot.py – WBAR を “1 分足オンリー” で回す最小 BOT
-────────────────────────────────────────────────────────
- • DataHandler1m : ccxt REST で確定 1 m 足を取得
- • Strategy      : 連続 2 本 + フィルタでエントリー
- • OrderManager  : 発注 & マーチン
- • OrderMonitor  : TP/SL 監視 + Notifier (Discord / Mail / Twilio)
 
-起動:  python run_bot.py   (.env がロード済みの前提)
-"""
+import asyncio
+import logging
+import os
+import signal
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Optional
 
-# ──────────────────────────────────────────────────────────
-# 0) 事前セットアップ
-# ──────────────────────────────────────────────────────────
-import warnings
-warnings.simplefilter("ignore", category=FutureWarning)   # これを追加
-
-# pandas concat の FutureWarning を黙らせる
-warnings.filterwarnings(
-    "ignore",
-    message="The behavior of DataFrame concatenation.*FutureWarning"
+# ---------- ロギング ---------- #
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    filename=LOG_DIR / "run_bot.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-import sys, asyncio, signal
-from datetime import datetime, timezone
-import ccxt
+# ---------- .env 読み込み ---------- #
+from dotenv import load_dotenv
 
-# Windows + aiodns 用: SelectorEventLoop を明示
+ENV_PATH = Path("config") / ".env"
+if ENV_PATH.exists():
+    load_dotenv(dotenv_path=ENV_PATH)
+else:
+    logger.warning(".env が見つかりません – 環境変数を直接参照します。")
+
+# ---------- 外部モジュール ---------- #
+from src.core.strategy import WBARSimpleStrategy
+from src.core.ws_listener import WSListener
+from src.monitor.stats_tracker import StatsTracker
+from src.monitor.risk_guard import RiskGuard
+
+# DataHandler1m が既に実装済み前提
+from src.data.data_handler import DataHandler1m  # ← 名前が違う場合は修正
+
+
+# ========================================================= #
+#  asyncio イベントループ（Windows で SelectorLoop 強制）
+# ========================================================= #
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# ─ 内部 import
-from config.settings import settings
-from utils.logger     import get_logger
-from src.core.strategy import Strategy
-from src.core.order_manager import OrderManager
-from src.order_monitor import OrderMonitor
-from src.notifier      import Notifier
 
-logger = get_logger(__name__)
+# ========================================================= #
+#  グローバルインスタンス
+# ========================================================= #
+SYMBOL = os.getenv("SYMBOL", "ETH_USDT")
+LOT = os.getenv("LOT", "0.01")
 
-# ──────────────────────────────────────────────────────────
-# 1) DataHandler – 1 m OHLCV を取得
-# ──────────────────────────────────────────────────────────
-class DataHandler1m:
-    """確定した 1-minute bar だけ返す軽量ハンドラ"""
+strategy = WBARSimpleStrategy(symbol=SYMBOL, lot=LOT)
+stats_tracker = StatsTracker()
 
-    def __init__(self, exchange: ccxt.Exchange, symbol: str):
-        self.exchange   = exchange
-        self.symbol     = symbol
-        self._last_ts_ms: int | None = None         # 重複排除
-        self._dup_warn_ts: int | None = None        # duplicate ログ抑制
+stop_event = threading.Event()
+risk_guard = RiskGuard(stop_event=stop_event)
 
-    async def poll(self) -> dict | None:
-        loop = asyncio.get_running_loop()
-        ohlcvs = await loop.run_in_executor(
-            None,
-            lambda: self.exchange.fetch_ohlcv(self.symbol, timeframe="1m", limit=2),
-        )
-        if not ohlcvs:
-            return None
-
-        ts_ms, o, h, l, c, v = ohlcvs[-2]           # 直近確定バー
-
-        # ─ duplicate 判定 ─
-        if ts_ms == self._last_ts_ms:
-            if self._dup_warn_ts != ts_ms:          # 同じ ts で 1 回だけ
-                logger.debug(f"[DataHandler] duplicate bar ts={ts_ms} – waiting")
-                self._dup_warn_ts = ts_ms
-            return None
-        self._dup_warn_ts = None                    # new bar → リセット
-        self._last_ts_ms  = ts_ms
-
-        return {
-            "timestamp": datetime.fromtimestamp(ts_ms / 1_000, tz=timezone.utc).isoformat(),
-            "open": o, "high": h, "low": l, "close": c,
-            "vol": v, "is_confirmed": True,
-        }
-
-    # Strategy.evaluate_and_execute 用ダミー
-    def get_confirmed_data(self):
-        return None
+# Balance 取得用 – ここではダミー。実装済み API に合わせて置き換え
+def get_account_balance() -> float:
+    return float(os.getenv("ACCOUNT_BALANCE_USDT", "1000"))
 
 
-# ──────────────────────────────────────────────────────────
-# 2) main coroutine
-# ──────────────────────────────────────────────────────────
-async def run_bot() -> None:
-    ex = ccxt.mexc({
-        "apiKey": settings.API_KEY,
-        "secret": settings.API_SECRET,
-        "options": {"defaultType": "future", "recvWindow": 60_000},
-        "enableRateLimit": True,
-    })
+# ========================================================= #
+#  WebSocket Listener – fill 時に Stats / Risk 更新
+# ========================================================= #
+def ws_thread() -> None:
+    """
+    別スレッドで WSListener を走らせ、約定をハンドリング。
+    OrderManager.on_fill() → Strategy.callback_after_fill()
+    という流れを想定し、Strategy から戻る pnl を受け取る。
+    """
+    class _ExtendedWS(WSListener):
+        def __init__(self, strat: WBARSimpleStrategy):
+            super().__init__(strat._om)
+            self._strategy = strat
 
-    strategy  = Strategy()
-    notifier  = Notifier()
-    om = OrderManager(
-        trade_logic = strategy,
-        ccxt_symbol = settings.CCXT_SYMBOL,
-        ws_symbol   = settings.WS_SYMBOL,
-        lot_size    = settings.LOT_SIZE,
-        leverage    = settings.LEVERAGE,
-        uid         = settings.UDI,
-        api_key     = settings.API_KEY,
-        api_secret  = settings.API_SECRET,
-    )
-    monitor = OrderMonitor(om, notifier=notifier)
-    dh      = DataHandler1m(ex, settings.CCXT_SYMBOL)
+        def _on_local_fill(self, filled_order_id: str, pnl: float, side: str):
+            """Strategy 側から呼び出される想定のコールバック"""
+            stats_tracker.add_trade(side=side, pnl=pnl)
+            risk_guard.on_trade(pnl=pnl, balance=get_account_balance())
 
-    # ─ warm-up (直近 29 本) ─
-    warm = ex.fetch_ohlcv(settings.CCXT_SYMBOL, timeframe="1m", limit=30)
-    for ts, o, h, l, c, v in warm[:-1]:
-        strategy.update_market_data({
-            "timestamp": datetime.fromtimestamp(ts / 1_000, tz=timezone.utc).isoformat(),
-            "open": o, "high": h, "low": l, "close": c, "vol": v, "is_confirmed": True,
-        })
-    logger.info(f"Prefilled {len(warm)-1} bars → instant start")
+        # Strategy から callback を登録
+    ws = _ExtendedWS(strategy)
+    try:
+        ws.run_forever()
+    except Exception as exc:
+        logger.exception(f"WS thread exception: {exc}")
+        stop_event.set()
 
-    # 起動通知 (INFO は Discord のみ送信)
-    await notifier.send("INFO", "✅ WBAR bot started – waiting for first 1-minute bar")
 
-    # ─ graceful shutdown ─
-    stop = asyncio.Event()
-    def _stop():
-        logger.warning("Received stop signal – shutting down…")
-        stop.set()
+# ========================================================= #
+#  メイン async ループ – 1 分足を処理
+# ========================================================= #
+async def main_loop():
+    dh = DataHandler1m(symbol=SYMBOL, warmup=29)
+    await dh.initialize()
 
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    # WS Listener スレッド起動
+    threading.Thread(target=ws_thread, name="WSListener", daemon=True).start()
+
+    while not stop_event.is_set():
         try:
-            loop.add_signal_handler(sig, _stop)
-        except NotImplementedError:                # Windows fallback
-            signal.signal(sig, lambda *_: _stop())
+            bar = await dh.get_next_bar()        # 1 分足確定を await
+            direction = strategy.evaluate(bar)   # "LONG"/"SHORT"/None
+            if direction:
+                entry_id: Optional[str] = strategy.place_entry(direction)
+                if entry_id:
+                    logger.info(f"Entry sent: {entry_id}")
 
-    logger.info("=== BOT STARTED (1-minute mode) ===")
+        except Exception as exc:
+            logger.exception(f"Main loop error: {exc}")
+            time.sleep(1)
 
-    # ─ main loop ─
-    while not stop.is_set():
-        try:
-            bar = await dh.poll()
-            if bar:
-                strategy.update_market_data(bar)
-                await strategy.evaluate_and_execute(om, dh)
-                await monitor.run()
-
-        except Exception as e:
-            logger.error(f"main loop error: {e}", exc_info=True)
-            # ERROR 通知は Discord + Mail + Twilio
-            await notifier.send("ERROR", f"main loop error: {e}")
-
-        await asyncio.sleep(settings.POLLING_INTERVAL)   # default = 5 s
-
-    logger.info("=== BOT EXIT ===")
+    logger.info("Stop event received – shutting down.")
 
 
-# ──────────────────────────────────────────────────────────
-# 3) entry-point
-# ──────────────────────────────────────────────────────────
+# ========================================================= #
+#  Graceful shutdown helpers
+# ========================================================= #
+def _signal_handler(sig, frame):
+    logger.info(f"Signal {sig} received, stopping…")
+    stop_event.set()
+
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+
+# ========================================================= #
+#  エントリポイント
+# ========================================================= #
 if __name__ == "__main__":
     try:
-        asyncio.run(run_bot())
+        asyncio.run(main_loop())
     except KeyboardInterrupt:
-        pass
+        logger.info("KeyboardInterrupt – exiting.")
