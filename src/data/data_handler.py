@@ -1,107 +1,118 @@
 #!/usr/bin/env python3
 """
-DataHandler1m
-=============
-
-MEXC Futures の 1 分足を簡易取得する非同期ハンドラ。
-- `initialize()` でウォームアップ N 本ロード
-- `get_next_bar()` で次の 1 分足が確定するまで待機し、終値バーを返す
+DataHandler1m  ―  MEXC Futures の 1 分足フェッチを最小構成で
+----------------------------------------------------------------
+* initialize()   : 最新 (warmup+1) 本をロードしてキャッシュ
+* get_next_bar() : 次の 1 分足が確定するまで await し、終値バーを返す
 
 依存:
-    pip install curl-cffi pytz
+    pip install curl-cffi
 """
 
 from __future__ import annotations
 
 import asyncio
-import datetime as _dt
+import datetime as dt
 import logging
-import os
+import time
 from typing import Dict, List
 
 from curl_cffi import requests
-import pytz
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-MEXC_KLINE_ENDPOINT = "https://contract.mexc.com/api/v1/contract/kline/{symbol}/60"  # 60 = 1m
+# ─────────────────────────────────────────────
+BASE_URL     = "https://contract.mexc.com"
+INTERVAL     = "Min1"      # 1 m 足
+MAX_RETRY    = 10
+DEFAULT_WARM = 10          # ウォームアップ本数
+# ─────────────────────────────────────────────
 
 
-def _utc_now_truncated() -> _dt.datetime:
-    """秒以下を 0 にした UTC"""
-    now = _dt.datetime.utcnow().replace(tzinfo=_dt.timezone.utc)
+def _utc_floor_minute() -> dt.datetime:
+    """UTC 現在時刻を秒以下 0 に丸めて返す"""
+    now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
     return now.replace(second=0, microsecond=0)
 
 
 class DataHandler1m:
-    def __init__(self, symbol: str, warmup: int = 29):
+    """MEXC の 1 m Kline を取得してキャッシュする軽量クラス"""
+
+    def __init__(self, symbol: str, warmup: int = DEFAULT_WARM):
         self.symbol = symbol
-        self._warmup = warmup
+        self._warm  = warmup
         self._cache: List[Dict] = []
 
-    # --------------------- Public --------------------- #
+    # ─────────────── public ─────────────── #
+
     async def initialize(self):
-        """最新 N+1 本をロードしてキャッシュ"""
-        bars = self._fetch_bars(self._warmup + 1)
+        """最新 warmup+1 本を取得してキャッシュ"""
+        bars = self._fetch_bars(self._warm + 1)
         if not bars:
             raise RuntimeError("Failed to fetch warm-up bars.")
         self._cache = bars
         logger.info(f"Warmed up {len(bars)} bars.")
 
     async def get_next_bar(self) -> Dict:
-        """
-        次の 1 分足が確定するまで await し、最新バー dict を返す。
+        """次の 1 分足が確定するまで待機し、最新バー dict を返す"""
+        now = _utc_floor_minute()
+        await asyncio.sleep(60 - now.second + 1)
 
-        Returns
-        -------
-        bar : dict
-            {"ts": epoch_ms, "open": .., "high": .., "low": .., "close": .., "volume": ..}
-        """
-        # 次の分足が確定するまで待つ
-        now = _utc_now_truncated()
-        wait_sec = 60 - (now.replace(tzinfo=None).second)
-        await asyncio.sleep(wait_sec + 1)
-
-        # 直近 2 本取得して最新だけ返す
         bars = self._fetch_bars(2)
         if not bars:
             raise RuntimeError("Failed to fetch new bar.")
 
         latest = bars[-1]
         if latest["ts"] == self._cache[-1]["ts"]:
-            # まだ同じバーなら次を待つ
-            return await self.get_next_bar()
+            return await self.get_next_bar()          # 同じ足なら再待機
 
         self._cache.append(latest)
-        if len(self._cache) > self._warmup + 1:
+        if len(self._cache) > self._warm + 1:
             self._cache.pop(0)
         return latest
 
-    # --------------------- Internal --------------------- #
+    # ─────────────── internal ─────────────── #
+
     def _fetch_bars(self, limit: int) -> List[Dict]:
-        """REST で最新 limit 本の 1 分足を取得"""
-        url = MEXC_KLINE_ENDPOINT.format(symbol=self.symbol)
-        params = {"limit": limit}
-        try:
-            r = requests.get(url, params=params, timeout=10)
-            data = r.json()
-            if not data.get("success"):
-                logger.error(f"Kline API error: {data}")
-                return []
-            klines = data["data"][-limit:]  # 保険でスライス
-            bars = [
-                {
-                    "ts": k["time"],  # epoch ms
-                    "open": float(k["open"]),
-                    "high": float(k["high"]),
-                    "low": float(k["low"]),
-                    "close": float(k["close"]),
-                    "volume": float(k["vol"]),
-                }
-                for k in klines
-            ]
-            return bars
-        except Exception as exc:
-            logger.exception(f"Kline fetch exception: {exc}")
-            return []
+        """
+        /contract/kline/{symbol}?interval=Min1&limit=N
+        を叩いて直近 limit 本の OHLCV を返す。
+        """
+        url    = f"{BASE_URL}/api/v1/contract/kline/{self.symbol}"
+        params = {"interval": INTERVAL, "limit": limit}
+
+        for _ in range(MAX_RETRY):
+            try:
+                r = requests.get(url, params=params, timeout=10)
+                data = r.json()
+
+                # 成功判定
+                if not (isinstance(data, dict) and data.get("success")):
+                    time.sleep(1)
+                    continue
+
+                k = data["data"]                      # 列ごとの配列
+                if len(k["time"]) < limit:
+                    time.sleep(1)
+                    continue
+
+                bars = [
+                    {
+                        "ts":     k["time"] [-limit:][i],          # epoch 秒
+                        "open":  float(k["open"] [-limit:][i]),
+                        "high":  float(k["high"] [-limit:][i]),
+                        "low":   float(k["low"]  [-limit:][i]),
+                        "close": float(k["close"][-limit:][i]),
+                        "volume":float(k["vol"]  [-limit:][i]),
+                    }
+                    for i in range(limit)
+                ]
+                return bars
+
+            except Exception as e:
+                logger.debug(f"Kline fetch retry fail: {e}")
+                time.sleep(1)
+
+        logger.error("All retries failed – no Kline data.")
+        return []
